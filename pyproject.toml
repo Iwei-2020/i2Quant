@@ -1,0 +1,244 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qis"
+version = "5.30.3"
+description = "Performance analytics, portfolio backtesting, risk analysis, and factsheet reporting in Python"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE.txt"]
+authors = [
+    {name = "Artur Sepp", email = "artursepp@gmail.com"},
+]
+maintainers = [
+    {name = "Artur Sepp", email = "artursepp@gmail.com"},
+]
+keywords = [
+    "quantitative finance",
+    "investment strategies",
+    "portfolio analytics",
+    "financial data visualization",
+    "backtesting",
+    "performance attribution",
+    "risk analysis",
+    "financial statistics",
+    "trading strategies",
+    "portfolio backtesting",
+    "factsheet reporting",
+    "tracking error",
+    "systematic strategies",
+    "volatility",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.10"
+
+dependencies = [
+    "numba>=0.63.0",
+    "numpy>=2.0",
+    "scipy>=1.12.0",
+    "statsmodels>=0.14.2",
+    "pandas>=2.2.0",
+    "matplotlib>=3.8.0",
+    "seaborn>=0.13.0",
+    "openpyxl>=3.1.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+data = [
+    "yfinance>=0.2.40",
+    "pandas-datareader>=0.10.0",
+]
+
+reports = [
+    "pybloqs>=1.2.13",
+    "jinja2>=3.0.0",
+]
+
+visualization = [
+    "plotly>=5.0.0",
+]
+
+io = [
+    "pyarrow>=14.0.0",
+    "fsspec>=2024.2.0",
+]
+
+database = [
+    "psycopg2>=2.9.5",
+    "SQLAlchemy>=2.0.0",
+]
+
+jupyter = [
+    "jupyter>=1.0.0",
+    "notebook>=6.5.0",
+    "jupyterlab>=3.0.0",
+    "ipykernel>=6.0.0",
+    "ipywidgets>=8.0.0",
+]
+
+docs = [
+    "sphinx>=8.0",
+    "myst-parser>=4.0",
+    "furo>=2024.8.6",
+]
+
+all = [
+    "qis[data,reports,visualization,io,database,jupyter,docs]",
+]
+
+# PEP 735 groups are repository tooling, not installable package extras.  CI uses these groups so
+# the core matrix does not silently acquire the data extra carried by the historical ``dev`` extra.
+[dependency-groups]
+test = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.10.0",
+]
+lint = [
+    "interrogate==1.7.0",
+    "ruff==0.14.2",
+]
+audit = [
+    "pip-audit==2.10.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/ArturSepp/QuantInvestStrats"
+Documentation = "https://quantinveststrats.readthedocs.io"
+Repository = "https://github.com/ArturSepp/QuantInvestStrats"
+Issues = "https://github.com/ArturSepp/QuantInvestStrats/issues"
+Changelog = "https://github.com/ArturSepp/QuantInvestStrats/blob/main/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["qis*"]
+exclude = [
+    "tests*",
+    "docs*",
+    "qis.run_local*",
+    "qis.*.run_local*",
+    "qis.*.*.run_local*",
+]
+
+[tool.setuptools.package-data]
+qis = ["*.yaml", "docs/*.md"]
+
+[tool.pytest.ini_options]
+# tests live inside the package, in src/qis/<subpackage>/tests/, not in a top-level tests/
+testpaths = ["src/qis"]
+norecursedirs = [".*", "examples", "notebooks", "build", "dist", "*.egg-info", "__pycache__"]
+# importlib import mode: test modules are resolved by full path, so the two
+# test_signal_diagnostics.py files in different subpackages do not collide
+addopts = "-ra -q --tb=short --import-mode=importlib --strict-config --strict-markers"
+cache_dir = "~/.cache/qis/pytest"
+markers = [
+    "mpl_image_compare: figure regression test; inert unless the pytest-mpl plugin is installed",
+]
+filterwarnings = [
+    # These are upstream deprecations emitted by seaborn against current matplotlib.  Match both
+    # message and originating module so an unrelated warning cannot disappear under the filter.
+    "ignore:The set_bad function will be deprecated.*:PendingDeprecationWarning:seaborn.matrix",
+    "ignore:vert.*bool was deprecated.*:matplotlib._api.deprecation.MatplotlibDeprecationWarning:seaborn.categorical",
+    # A deprecation or future-compatibility warning originating in qis is actionable and gates CI.
+    "error::DeprecationWarning:qis\\..*",
+    "error::FutureWarning:qis\\..*",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# "I" (isort) is deliberately absent: the house convention groups stdlib imports under the
+# "# packages" marker after numpy/pandas, which isort will always want to reorder. Keeping the
+# rule would fail every file written to the documented convention. See AGENTS.md, Conventions.
+select = ["E", "F", "W"]
+
+# --- stack invariants as lint, not prose ---------------------------------------------------
+# TID251 bans an import outright, TID253 bans it only at module level, ICN pins the numpy and
+# pandas aliases. None belongs to the "I" (isort) family, so the import-grouping convention is
+# untouched. Verified green on the repository as it stands.
+extend-select = ["TID251", "TID253", "ICN"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+# A1: qis is the base layer. Imports flow one way only; it never imports a dependent or a
+# subject package. If a change appears to need one of these, the code belongs in the lower
+# package -- say so rather than adding the import.
+"optimalportfolios".msg = "A1: qis is the base layer and must never import optimalportfolios."
+"factorlasso".msg = "A1: qis must never import factorlasso."
+"trendfollowing".msg = "A1: the core never imports a subject package."
+"privateassets".msg = "A1: the core never imports a subject package."
+"stochvolmodels".msg = "A1: the core never imports a subject package."
+"goal_based_allocation".msg = "A1: the core never imports a subject package."
+"vanilla_option_pricers".msg = "A1: the core never imports a subject package."
+"bbg_fetch".msg = "A1: qis has no declared dependency on bbg_fetch."
+"option_chain_analytics".msg = "A1: qis has no declared dependency on option_chain_analytics."
+
+[tool.ruff.lint.flake8-tidy-imports]
+# A3: an optional extra is imported inside a function and guarded, never at module level, so a
+# core install keeps working. A module dedicated to a single optional backend is the documented
+# exception and is named in per-file-ignores below.
+banned-module-level-imports = ["yfinance", "pandas_datareader", "pybloqs", "plotly", "pyarrow",
+                               "psycopg2", "sqlalchemy"]
+
+[tool.ruff.lint.flake8-import-conventions.aliases]
+# replaces ruff's default alias map, which also demands `matplotlib as mpl` everywhere. Only
+# numpy and pandas are house convention; matplotlib is legitimately both `mpl` and `plt` here.
+numpy = "np"
+pandas = "pd"
+
+[tool.ruff.lint.per-file-ignores]
+# Named source-only provider runner; the AST policy limits this waiver to bbg_fetch.
+"src/qis/market_data/run_local/fx_rates_data_run.py" = ["E501", "TID253", "TID251"]
+
+# an __init__.py re-exports: the public API is defined as what these files import, so every
+# one of the 398 imports across them is "unused" by F401's definition and none is a defect
+"**/__init__.py" = ["F401"]
+# examples are documentation and run top to bottom: a module-level yfinance import is correct
+"examples/**" = ["TID253"]
+# modules dedicated to one optional backend. None is reachable from qis/__init__.py, so
+# `import qis` on a core install never touches them (checked: pybloqs, plotly and sqlalchemy are
+# absent from sys.modules after `import qis`).
+"src/qis/plots/derived/gantt_data_history.py" = ["TID253"]
+"src/qis/portfolio/reports/multi_strategy_factsheet_pybloqs.py" = ["TID253"]
+"src/qis/portfolio/reports/strategy_benchmark_factsheet_pybloqs.py" = ["TID253"]
+"src/qis/sql_engine.py" = ["TID253"]
+# Development-only runners may exercise an optional backend and retain legacy analytical lines
+# longer than the production limit. Production modules never import this tree;
+# ``module_layout_test.py`` enforces that one-way boundary.
+"src/qis/**/run_local/*_run.py" = ["E501", "TID253"]
+
+[tool.interrogate]
+# User-facing source is the documentation target; pytest functions are verification rather than
+# API documentation.  ``*tests`` is separator-independent because interrogate appends its own
+# wildcard before matching paths.  The measured production-source baseline is 68.5%.
+fail-under = 68
+exclude = ["*tests", "*run_local"]
+
+[tool.coverage.run]
+source = ["qis"]
+omit = ["*/tests/*", "*/examples/*", "*/run_local/*"]
+
+[tool.coverage.report]
+# This is a regression ratchet, not the destination.  Reports and plots remain measured because
+# they are core qis functionality; raise the floor as substantive legacy tests are converted.
+precision = 2
+fail_under = 53

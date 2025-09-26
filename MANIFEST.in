@@ -1,0 +1,43 @@
+# MANIFEST.in
+# Controls what files are included in the source distribution (sdist)
+
+# Include essential package files
+include README.md
+include LICENSE.txt
+include pyproject.toml
+include requirements*.txt
+
+# Include all Python source files
+recursive-include src/qis *.py
+
+# Development runners belong to a checkout, not to source or wheel distributions
+prune src/qis/run_local
+prune src/qis/*/run_local
+prune src/qis/*/*/run_local
+
+# Include specific data files that the package needs
+recursive-include src/qis/data *.csv
+recursive-include src/qis/templates *.html
+recursive-include src/qis/static *.css *.js
+recursive-include src/qis *.yml *.yaml *.json *.txt *.md
+
+# Explicitly exclude figures, notebooks, and image files
+recursive-exclude examples/figures *
+# Renderer modules such as _figures.py are source; exclude image formats below.
+global-exclude *.png
+global-exclude *.jpg
+global-exclude *.jpeg
+global-exclude *.gif
+global-exclude *.svg
+global-exclude *.pdf
+global-exclude *.eps
+global-exclude *.ipynb
+
+# Exclude development and build artifacts
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
+recursive-exclude * .DS_Store
+recursive-exclude * .git*
+recursive-exclude * *.egg-info
+global-exclude *.pyc
+global-exclude *.pyo
