@@ -1,0 +1,390 @@
+## Python environment (mandatory)
+
+- Never create, use, or install packages into a Python virtual environment anywhere under `C:\Users\artur\OneDrive`.
+- Keep this repository's environment outside OneDrive at `C:\Python\QuantInvestStrats312`.
+- Use `C:\Python\QuantInvestStrats312\Scripts\python.exe` for Python, tests, linters, and package installation.
+- If it is missing, create it with `py -3.12 -m venv C:\Python\QuantInvestStrats312`.
+- Never run plain `uv sync` or plain `uv run` from this checkout: uv otherwise creates `<repo>\.venv` even when uv was launched through a Python executable under `C:\Python`.
+- If a uv project operation is required, first set `UV_PROJECT_ENVIRONMENT=C:\Python\QuantInvestStrats312`; for pip-style operations prefer `uv pip ... --python C:\Python\QuantInvestStrats312\Scripts\python.exe`.
+- If any OneDrive-local environment already exists, do not use it; report it for removal.
+- Run standard portfolio tasks through
+  `& "$env:USERPROFILE\OneDrive\analytics\my_github\ArturSepp\scripts\repo_governance\Invoke-Repo.ps1" -Task verify`.
+  Use `-Task check` or `-Task test` for a narrower run. The launcher selects this repository's
+  external interpreter and routes generated state to C:.
+
+# AGENTS.md
+
+Guidance for AI coding agents working in the **QuantInvestStrats** repository.
+
+## Project overview
+
+`qis` (Quantitative Investment Strategies) is the analytics and reporting engine of the
+stack: time-series and cross-sectional performance analytics, risk-adjusted performance
+tables, factsheet generation, and a matplotlib/seaborn visualisation layer for financial
+data. It is a dependency of `optimalportfolios` and `trendfollowing`, so changes to its
+public API have downstream consequences outside this repository.
+
+Distribution name `qis`; import name `qis`. Licensed MIT (`LICENSE.txt`).
+
+## Ecosystem position
+
+This package is one of ten public Python libraries maintained at
+[github.com/ArturSepp](https://github.com/ArturSepp). Check the owning package before
+adding a capability or copying code between repositories.
+
+| Package | Repository | Purpose |
+|---|---|---|
+| `qis` | QuantInvestStrats | performance analytics, backtesting, and factsheet reporting |
+| `optimalportfolios` | OptimalPortfolios | portfolio construction and rolling backtesting |
+| `factorlasso` | FactorLasso | sparse factor-model estimation |
+| `bbg-fetch` | BloombergFetch | Bloomberg data in pandas DataFrames |
+| `stochvolmodels` | StochVolModels | stochastic-volatility pricing and calibration |
+| `trendfollowing` | TrendFollowingSystems | closed-form trend-following analytics |
+| `privateassets` | PrivateAssets | multi-factor PME for private assets |
+| `goal-based-allocation` | GoalBasedAllocation | goal-based allocation under regime-switching jump-diffusions |
+| `vanilla-option-pricers` | VanillaOptionPricers | Numba-vectorised BSM and Bachelier pricing |
+| `option-chain-analytics` | OptionChainAnalytics | point-in-time option-chain data and queries |
+
+Core dependency edges: `optimalportfolios` consumes `qis` and `factorlasso`;
+`trendfollowing` and `privateassets` consume `qis`; `stochvolmodels` consumes
+`vanilla-option-pricers`; `option-chain-analytics` consumes `qis` and
+`vanilla-option-pricers`. The remaining packages have no core stack dependencies.
+
+Optional edges: PrivateAssets' `factors` extra adds `factorlasso`; StochVolModels'
+`research` extra adds `qis` and `option-chain-analytics`; OCA's `bloomberg` and `all`
+extras add `bbg-fetch`. Core imports must work without optional dependencies.
+OCA never imports StochVolModels or the private SigmaStrats consumer. Exact
+maintainer-tool exceptions are recorded in `.github/stack-policy.json`; they do
+not authorise adding those dependencies to core or importing them at package root.
+
+## Repository layout
+
+```
+src/qis/
+  perfstats/      performance and risk statistics
+  plots/          visualisation layer (matplotlib/seaborn)
+  portfolio/      portfolio objects, factsheets, multi-strategy reports
+  models/         estimators and models
+  market_data/    data access helpers
+  <component>/run_local/  source-adjacent development diagnostics named *_run.py
+  examples/       runnable examples
+  docs/           notebooks and documentation sources
+  file_utils.py, local_path.py, sql_engine.py, settings.yaml
+notebooks/        Jupyter notebooks
+```
+
+Tests live **inside** the package next to the code they cover, as
+`src/qis/<subpackage>/tests/*_test.py` — there is no top-level `tests/` directory.
+
+## Test data
+
+`src/qis/datasets/synthetic.py` is the data source for tests, CI and any documented example.
+`src/qis/tests/synthetic_data.py` is a compatibility shim for the path the 5.2 quickstart documented.
+It draws a 10-instrument multi-asset panel from a fixed seed with the defects real panels carry
+(ragged starts, missing observations, stale prices, a delisted tail, fat tails, appraisal
+smoothing, a monthly-reported sleeve). No network, no data file, no vendor licence. The module
+is frozen — see its docstring before changing anything in it.
+
+`src/qis/run_local/price_data_run.py` (`load_etf_data`) reads a local csv that is **not** distributed
+with the package and is regenerated by hand with the `[data]` extra. It is fine inside a
+`run_local` block; it must not appear in a pytest test or in CI.
+
+## Commands
+
+```bash
+pip install -e .                  # core install; this is what CI and a reviewer run
+pip install -e ".[data,io]"       # adds yfinance/pandas-datareader and pyarrow
+pytest                            # run the test suite; testpaths is set to src/qis/
+pytest src/qis/plots/tests/plot_smoke_test.py   # every exported plot_* draws (~5 min)
+pytest src/qis/perfstats/tests/ -v    # run one subpackage
+ruff check src/qis/                   # lint (see Known issues)
+```
+
+The suite must pass on a **core** install. Anything needing an optional extra is skipped, not
+failed — see `requires_pyarrow` in `src/qis/tests/file_utils_test.py` for the pattern.
+
+Optional extras: `data`, `reports`, `visualization`, `io`, `database`, `jupyter`.
+Supported Python is >= 3.10; CI runs the matrix 3.10 – 3.14.
+
+## Conventions
+
+- Automated test files live in a `tests/` directory inside the subpackage under test. New feature
+  tests use `*_test.py`; established central contracts may retain `test_*.py`. Every test-shaped
+  file collects at least one pytest test and contains no manual dispatcher or `__main__` launcher.
+- Component development diagnostics live beside their implementation in
+  `run_local/<subject>_run.py`. They use `class Locals(Enum)`, `run_local(local=...)`, and a main
+  guard containing only that call. Production modules never import `run_local`, and wheels exclude
+  the runner packages. Repository-level examples retain their established example-runner
+  convention because they demonstrate larger user workflows rather than component development.
+- Line length 100 (`ruff`, rules `E`, `F`, `W`). Run `ruff check` on the files you touched
+  before finishing; CI gates the diff, not the repository. The isort rule `I` is deliberately
+  not selected — it contradicts the import convention above.
+- **Three stack invariants are enforced by ruff rather than written down.** Unlike `E`/`F`/`W`
+  they are green on the whole repository, so a violation is always yours:
+  - `TID251` fails any import of `optimalportfolios`, `factorlasso` or a subject package. `qis`
+    is the base layer and imports flow one way only. If a change appears to need one, the code
+    belongs in the lower package — say so rather than adding the import.
+  - `TID253` fails a **module-level** import of an optional extra (`yfinance`,
+    `pandas_datareader`, `pybloqs`, `plotly`, `pyarrow`, `psycopg2`, `sqlalchemy`); the same
+    import inside a function passes, which is the documented pattern. `examples/**` and the
+    four modules dedicated to a single optional backend are named in `per-file-ignores` — add to
+    that list only for a module `qis/__init__.py` cannot reach.
+  - `ICN` pins `import numpy as np` and `import pandas as pd`. Ruff's default alias map is
+    replaced rather than extended, so `matplotlib` stays free to be both `mpl` and `plt`.
+- **Docstrings are Google-style** (`Args:` / `Returns:` / `Raises:`, `Attributes:` on a class
+  or enum), rendered through `napoleon`. `src/qis/tests/test_docstring_convention.py` fails the
+  suite on a numpydoc section heading. `factorlasso` is the one package in the stack that keeps
+  numpydoc — it is sklearn-compatible and its readers arrive from a numpydoc ecosystem. That
+  exception is per-package and stays per-package; do not mix the two inside `qis`.
+- **`qis.__all__` is the public surface**, fixed at the end of `src/qis/__init__.py`. Do not use
+  `dir(qis)` to decide what is public: importing a submodule binds its name on the package, so
+  `dir(qis)` is one name longer after `import qis.api`. `src/qis/api.py`'s `PUBLIC_API` records the
+  same list as a literal; regenerate it with `python tools/sync_public_api.py` when an export is
+  added or removed, or `src/qis/tests/test_core_api.py` fails.
+- **Everything in `src/qis/api.py`'s `CORE_API` must carry an `Args:`/`Attributes:` block.**
+  `src/qis/tests/test_core_api.py` enforces it, and also that a documented argument exists in the
+  signature. Arguments shared across the `plot_*` functions are documented once in
+  `src/qis/docs/plotting_kwargs.md`; a plot docstring covers only what is specific to it.
+- Enums are used heavily (100+ modules) for options and switches; prefer an enum
+  member over a string literal when one already exists.
+- Dataclasses are used for configuration and result containers.
+- The public surface is re-exported from `src/qis/__init__.py`; anything added there is
+  part of the public API and must not be removed casually.
+- Data structures are pandas `DataFrame`/`Series` with a `DatetimeIndex`. Functions
+  return pandas objects rather than numpy arrays unless there is a reason not to.
+
+## Constraints — do not do these
+
+- Do not change the signature or behaviour of anything exported from `qis/__init__.py`
+  without flagging it: `optimalportfolios` and `trendfollowing` import from it.
+- Do not add hard runtime dependencies. Optional functionality belongs behind an
+  extra in `[project.optional-dependencies]` with a guarded import.
+- Do not commit generated factsheets, PDFs, or figure output, except reviewed documentation
+  preview PNGs and their provenance record explicitly allowlisted by the documentation analytics
+  manifest. Generate on C-local storage and copy back only those intentional deliverables.
+- Do not modify `settings.yaml` or `local_path.py` to hardcode a machine-specific path.
+- Examples must run on free data (yfinance) — do not make an example require Bloomberg.
+
+## Methodology and analytics documentation
+
+- Follow the [shared OSS documentation standard](https://github.com/ArturSepp/ArturSepp/blob/main/docs/documentation_standard.md)
+  for common article structure, linked Artur Sepp authorship, evidenced First recorded dates,
+  portable Markdown math, citations, and review requirements.
+- Follow [the QIS supplement](docs/documentation_standard.md) for package-specific source
+  ownership, analytical conventions, figure producers, and validation commands. Methodology
+  articles use `Implementation in qis`; utility pages use the shared shorter form.
+- Include ordinary links to the qis repository and `CITATION.cff` in every human-authored page.
+  Define units, return convention, sampling/estimation frequency, annualisation, and timing
+  where they affect the calculation. A source pass does not establish numerical or viewer review.
+- Check revised pages with `python tools/check_docs.py --files docs/<page>.md`. The default
+  checks adopted pages and reports pending migration; `--all` requires the entire inventory.
+  Run Python tools only after the mandatory C-local setup below. Source checks do not replace
+  numerical verification, strict Sphinx builds, or inspection in the supported Markdown viewers.
+- Register every displayed analytics figure in `tools/docs_analytics/manifest.json`. Regenerate
+  the full bundle with `python -m tools.docs_analytics.run --all --output-dir <new-local-bundle>`.
+  Follow its README to review and publish all seven previews with their provenance; verify them
+  with `python -m tools.docs_analytics.publish --verify --repo <checkout>`. Record the producer,
+  sample, conventions and actual qis source version. Keep captions and displayed numbers tied
+  to the same computed result.
+- Distinguish fixed synthetic sample dates, observed-data as-of dates, generation timestamps,
+  and substantive review dates. Re-rendering a teaching figure does not require new market data
+  or a changed seed. Numerical functions remain in their canonical qis modules.
+- Preserve ordinary source links beside Sphinx includes and generated API references. Keep
+  `src/qis/docs/` text-only and `docs/brinson_attribution.md` authoritative for Brinson methodology.
+
+<!-- ===== SHARED AGENT CORE (builder variant) — begin =====
+     Generated from SHARED_AGENT_CORE.md in the maintainer's project knowledge. Do not hand-edit
+     between these markers — propose the change to the maintainer instead. Variants: builder
+     (qis) / consumer / standalone. Last synced 2026-09-13, agent core v1.6 -->
+
+## Domain invariants
+
+Not inferable from any single file, and the source of numerically wrong code that runs clean:
+
+- **No look-ahead, anywhere in a backtest path.** A weight decided at *t* is applied over
+  *[t, t+1]*. Estimation is point-in-time: `MeanAdjType.INSAMPLE` subtracts a full-sample mean
+  and is therefore forward-looking — correct for a descriptive exhibit, wrong inside a backtest.
+- **`qis` holds units, not weights, between rebalancings.** Drift adjustment is the difference
+  between a backtest and a weighted average of returns.
+- **Return convention is stated, never implied** — `qis.to_returns(..., is_log_returns=...)`.
+  Annualisation follows from the frequency; never silently switch convention, frequency, or
+  annualisation factor.
+- **Sharpe has three explicitly labelled conventions**; excess variants need
+  `PerfParams.rates_data`. State which one a number uses.
+- **`BootstrapType.STATIONARY` wraps circularly from qis 5.1.0.** Any result resampled under an
+  earlier version does not reproduce.
+- One convention per concept across the stack. If two packages disagree, that is a bug to
+  report, not a difference to accommodate.
+
+## Stack polarity
+
+`qis` is the base layer of the stack: implementing performance statistics, drawdowns and
+annualisation *here* is the job, and the sibling packages consume them. The dependency rules are
+in Conventions (`TID251`). Never introduce `quantstats`, `pyfolio`, `empyrical`, `ffn`, `bt`, or
+an ad-hoc statistics layer alongside the package's own.
+
+Ex-ante tracking error, factor exposures, benchmark beta, TE decomposition and marginal TE live
+in `qis.RiskModel` (`qis/portfolio/risk/risk_model.py`); the ex-post home is the adjacent
+`qis/portfolio/risk/ex_post_tracking_error.py` — `compute_ewma_realised_tracking_error` for the
+EWMA series, `compute_te_ir_errors` / `compute_info_ratio_table` for whole-sample TE/IR
+scalars. Inside qis, extend those modules — a second implementation of `d' Σ d` or of an EWMA
+of return differences anywhere in this repository is a defect.
+
+**Never invent a symbol.** If a function, class, or keyword argument is not in the export
+surface (`qis.__all__`), it does not exist. Check in one line —
+`python -c "import qis; print([n for n in dir(qis) if 'unsmooth' in n.lower()])"` — and say a
+symbol is missing rather than producing code that calls it.
+
+## Verification loop
+
+- Plan → patch → verify. Name the verification command and its result when proposing a patch.
+- A second pass is mandatory where a plausible patch can be numerically wrong and still run
+  clean: estimation windows, weight normalisation, annualisation, the unsmoothing path, anything
+  resampled. Verify against a reference computed a different way, and say which.
+- Prove a new test fails before trusting that it passes: reintroduce the defect, watch it fail,
+  restore.
+
+## Escalation and scope
+
+- Stop and propose before proceeding when a change would exceed roughly five files, alter a
+  public signature, or touch a numerical path.
+- Never change numerical results, random seeds, or computed values unless the change is the
+  request.
+- A public-signature change carries a `CHANGELOG.md` entry and a version bump in the same
+  change. Removing a keyword argument from a function taking `**kwargs` is a silent break — the
+  caller's keyword is swallowed and nothing raises. Treat it as breaking.
+- Do not refactor beyond the requested scope. Propose the wider change; do not perform it.
+
+## Concurrent sessions
+
+More than one agent or session may work on this checkout at the same time, so a file can change
+between your read of it and your write.
+
+- Re-read a file from disk immediately before editing it. Never write a file from an earlier
+  read: a whole-file write from a stale copy silently reverts another session's work.
+- Prefer minimal anchored edits over whole-file replacement. If the on-disk content is not what
+  you expected, stop and reconcile your change onto the current content rather than overwrite.
+
+## Agent-generated artifacts
+
+All agent-generated roadmaps, execution plans, audits, reports, handoffs, and other working
+outputs live under the repository-root `agents/` directory, which is local and ignored by Git.
+Never create `ROADMAP_*.md`, `Claude outputs/`, `Codex outputs/`, or similar agent-output
+artifacts at the repository root. Name feature roadmaps `agents/ROADMAP_<feature>.md`. An
+execution request names the file and stage. A stage is complete when its stated verification
+command passes; its out-of-scope list is binding.
+
+<!-- ===== SHARED AGENT CORE — end ===== -->
+
+## Generated records
+
+`docs/audit/` holds measurements rather than prose, and three scripts under `tools/` write them.
+Regenerate before cutting a tag, never by hand:
+
+```bash
+python tools/sync_public_api.py     # src/qis/api.py PUBLIC_API from the namespace
+python tools/paper_audit.py         # docs/audit/paper_numbers.json, every number paper.md quotes
+python tools/audit_consumers.py     # docs/audit/consumers.json, qis usage in public consumers
+```
+
+`tools/paper_audit.py --check` and `tools/sync_public_api.py --check` report drift without
+writing. Neither runs in CI: the consumer audit needs the network, and the git metrics move on
+every commit, so a CI check on them would fail on every push. `src/qis/tests/test_paper_audit.py`
+enforces the part that can be enforced offline.
+
+**Those records live in `docs/`, which is not shipped, so `test_paper_audit.py` and the
+`reproducibility.md` check in `test_bootstrap_convention.py` skip when the suite is run against an
+installed wheel rather than a checkout.** That is deliberate - they are repository-integrity
+tests, and a test that fails for a user who pip-installed the package would be worse than one that
+skips. It does mean the suite a wheel user runs is smaller than the one CI runs.
+
+## Two documentation trees, and which is which
+
+`src/qis/docs/` ships inside the wheel; `docs/` does not. The rule is whether a reader who ran only
+`pip install qis` needs the file:
+
+- **`src/qis/docs/*.md` ships.** Twenty docstrings reference these notes by package-relative path, so
+  `help(qis.plot_bars)` names `qis/docs/plotting_kwargs.md` and that file is in the reader's
+  site-packages. Keep them text-only; images do not ship, and a relative image link here is a dead
+  link for every installed user.
+- **`docs/` is the Sphinx site and the generated records.** `conf.py` mirrors `src/qis/docs/` into
+  `docs/_included/` at build time so the site reads as one tree while the package keeps one source
+  of truth. Do not move package notes up, and do not move site pages down.
+- **Brinson attribution is an explicit exception.** `docs/brinson_attribution.md`
+  contains the complete, authoritative methodology and calculation contract.
+  `src/qis/docs/brinson_attribution.md` is only a pointer for installed users.
+  Keep all Brinson methodology in the top-level document; do not replace it with
+  an include wrapper or duplicate its formulas in the packaged note.
+
+## Release checklist
+
+A release touches three version locations. All three must agree:
+
+1. `version` in `pyproject.toml`
+2. `version` and `date-released` in `CITATION.cff`
+3. the software BibTeX entry in `README.md` (if it pins a version)
+
+For an authorized publication: commit, tag that exact main-reachable commit as
+`v<version>`, then build, verify and publish its artifacts. Frequent PyPI updates are
+supported. A GitHub Release page is optional and created only when requested; it is not
+required for a local build, pip installation or routine package publication. Development
+versions on main may be ahead of PyPI. Do not publish or bump a version for unrelated work.
+
+## Known issues
+
+`ruff check src/qis/` reports about 2,250 violations on a clean checkout (mostly `E501` and `F401`),
+so a repo-wide lint gate would be red on arrival. CI therefore lints only the files a push or
+pull request changes, and reports the repo-wide count without failing on it. The `I001` conflict
+is resolved: `I` is no longer selected, because it contradicts the documented import
+convention.
+
+`src/qis/portfolio/reports/factsheet_facade.py` annotates `factsheet()` with quoted forward
+references (`"PortfolioData"`, `"TimePeriod"`, ...) that are never imported. This is harmless at
+runtime because annotations are not evaluated, but `typing.get_type_hints()` raises on it and
+Sphinx autodoc will trip over it. Fix with a `TYPE_CHECKING` import block when the docs site is
+built.
+
+The FX-rates development runner intentionally omits the former `CREATE_DATA` case: Bloomberg
+construction belongs in the consuming production layer, while QIS loads and analyses supplied
+provider-neutral panels.
+
+`src/qis/tests/test_reporting_goldens.py` checks the multi-asset report's panel count and axes
+geometry across reporting frequencies. It does not compare baseline images or prove that text,
+legends, and tables are readable; documentation previews also need visual review.
+
+## OneDrive Git durability and C-local execution
+
+- The primary checkout and its complete `.git` directory are the authoritative durable
+  repository state and must remain under OneDrive. This includes the object database, index,
+  unpushed commits, stashes, refs, reflogs, linked-worktree administration, hooks and local
+  repository configuration. Never relocate any of them to `C:\git`, temp storage,
+  `$env:AGENT_LOCAL_ROOT`, an external object directory, or a machine-local clone.
+- Agent-created environments, caches, scratch files, diagnostics, builds, analyses, test
+  output and run output belong below the local C-drive root `$env:AGENT_LOCAL_ROOT`, in a
+  machine- and task-specific directory. Never create a repository-local `.venv`, cache, or
+  disposable run directory in OneDrive. Copy back only intentional durable deliverables.
+- Pure test and release runs use a `git archive` source export on C. Isolated source edits may
+  use a locked, machine-named C-drive linked worktree; checkpoint intentional changes to a
+  machine-namespaced branch or stash before pausing or handing off.
+- Never prune, repair, unlock, rename or remove another computer's or task's worktree. Never
+  use desktop and laptop concurrently against the OneDrive-backed repository root.
+<!-- BEGIN C-LOCAL GENERATED STATE HELPERS -->
+### Mandatory C-local generated-state helpers
+
+- Before Python, uv, pytest, Ruff, mypy, coverage, or similar Python-tool work in this
+  repository or a linked worktree, run the shared setup in the PowerShell session that will
+  run those tools:
+  `. "$env:USERPROFILE\OneDrive\analytics\my_github\ArturSepp\scripts\repo_governance\Enter-AgentRepo.ps1"`.
+  Run it again after switching repositories or worktrees. Do not override the paths it sets
+  back into OneDrive.
+- The setup routes bytecode, tool caches, coverage data, temporary files, builds, analyses,
+  outputs, and runs below `$env:LOCALAPPDATA\AgentWork`. Never create or use repository-local
+  `.venv`, `__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, or equivalent
+  generated-state directories.
+- Build LaTeX only through
+  `& "$env:USERPROFILE\OneDrive\analytics\my_github\ArturSepp\scripts\repo_governance\Build-AgentLatex.ps1"`
+  with `-MainTex <path>`. The helper keeps auxiliary and output files on C. Use `-Publish`
+  only to copy an intentional final PDF beside its source; use `-ForcePublish` only after
+  reviewing an existing destination.
+<!-- END C-LOCAL GENERATED STATE HELPERS -->
+<!-- END ONEDRIVE GIT / C-LOCAL AGENT POLICY -->

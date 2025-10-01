@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: "qis: Performance analytics, portfolio backtesting, risk analysis, and factsheet reporting in Python"
+authors:
+  - family-names: Sepp
+    given-names: Artur
+    orcid: "https://orcid.org/0000-0002-7038-1748"
+repository-code: "https://github.com/ArturSepp/QuantInvestStrats"
+url: "https://pypi.org/project/qis/"
+license: MIT
+version: 5.30.3
+date-released: "2026-09-22"
+keywords:
+  - quantitative-finance
+  - performance-attribution
+  - portfolio-analytics
+  - portfolio-backtesting
+  - risk-analysis
+  - factsheet-reporting
+  - factsheets
+  - data-visualization
+  - python
