@@ -1,0 +1,212 @@
+# SHARED CI CORE v1.0 — T2 — synced 2026-08-22
+name: CI
+run-name: ${{ github.event_name == 'schedule' && 'Dependency compatibility (live resolution)' || 'CI' }}
+
+# Every job only checks out and reads the repository.  Declare the minimum token scope rather
+# than inheriting repository defaults, especially for pull requests that execute changed code.
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+  schedule:
+    - cron: "37 3 * * *"
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  MPLBACKEND: Agg  # no display on the runner
+
+jobs:
+  # The Linux cells cover every supported interpreter.  Windows and macOS run the authoritative
+  # 3.12 version to exercise platform paths and plotting backends without multiplying the
+  # eight-to-sixteen-minute suite across a 15-cell Cartesian product. All change-validation cells use
+  # uv.lock; the scheduled compatibility run resolves current compatible dependencies.
+  test:
+    name: pytest (core, ${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.12"
+            locked: true
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: ubuntu-latest
+            python-version: "3.14"
+          - os: windows-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.12"
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Install uv and Python ${{ matrix.python-version }}
+      uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Sync the core test environment
+      # The primary cell fails if pyproject.toml and uv.lock disagree.  Floating cells upgrade the
+      # resolution so compatibility with what a new installer receives remains covered.
+      run: uv sync --group test ${{ github.event_name == 'schedule' && '--upgrade' || '--locked' }}
+
+    - name: Run tests
+      run: uv run --no-sync pytest
+
+  # the same suite with the optional extras present, so the tests skipped above actually run
+  test-extras:
+    name: pytest (data + io extras)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Install uv and Python
+      uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        python-version: "3.12"
+
+    - name: Sync the locked data and io environment
+      run: uv sync --group test --extra data --extra io --locked
+
+    - name: Run tests with coverage
+      # [tool.coverage.report] owns the regression floor; the report remains broad because plots
+      # and factsheets are core qis functionality rather than disposable presentation wrappers.
+      run: uv run --no-sync pytest --cov=qis --cov-report=term:skip-covered
+
+  wheel:
+    # Editable installs exercise the src tree, not the artifact users receive. Build and install
+    # the wheel in a clean environment so missing packages, tests or package data cannot pass CI.
+    name: built wheel (core install)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Install uv and Python
+      uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        python-version: "3.12"
+
+    - name: Build the wheel from the source distribution
+      run: |
+        uv build --sdist --clear --out-dir dist
+        uv build --wheel dist/*.tar.gz --out-dir dist
+
+    - name: Assert package tests and documentation ship
+      run: |
+        python - <<'PY'
+        import glob
+        import zipfile
+
+        wheels = glob.glob("dist/*.whl")
+        assert len(wheels) == 1, f"expected one wheel, found {wheels}"
+        with zipfile.ZipFile(wheels[0]) as archive:
+            names = set(archive.namelist())
+        tests = [name for name in names if name.startswith("qis/") and name.endswith("_test.py")]
+        examples = [name for name in names if name.startswith("qis/examples/")]
+        runners = [name for name in names if name.startswith("qis/") and "/run_local/" in name]
+        bytecode = [
+            name for name in names
+            if "/__pycache__/" in name or name.endswith((".pyc", ".pyo"))
+        ]
+        expected_docs = {
+            "qis/docs/plotting_kwargs.md",
+            "qis/docs/reporting_frequencies.md",
+            "qis/docs/sharpe_conventions.md",
+            "qis/docs/portfolio_stress.md",
+        }
+        expected_stress = {
+            "qis/portfolio/stress/__init__.py",
+            "qis/portfolio/stress/instruments.py",
+            "qis/portfolio/stress/portfolio.py",
+            "qis/portfolio/stress/scenarios.py",
+            "qis/portfolio/stress/analytics.py",
+            "qis/portfolio/stress/reporting.py",
+            "qis/portfolio/stress/_figures.py",
+            "qis/portfolio/stress/tests/public_api_test.py",
+        }
+        missing_stress = sorted(expected_stress - names)
+        assert not missing_stress, f"the wheel misses stress interfaces: {missing_stress}"
+        missing_docs = sorted(expected_docs - names)
+        assert tests, "the wheel ships no qis test modules"
+        assert not examples, f"repository examples leaked into the wheel: {examples[:5]}"
+        assert not runners, f"development runners leaked into the wheel: {runners[:5]}"
+        assert not bytecode, f"Python bytecode leaked into the wheel: {bytecode[:5]}"
+        assert not missing_docs, f"the wheel misses packaged documentation: {missing_docs}"
+        assert "qis/settings.yaml" in names, "the wheel misses settings.yaml"
+        print(f"{wheels[0]}: {len(tests)} test modules and required package data present")
+        PY
+
+    - name: Install the wheel into a clean environment
+      run: |
+        uv venv --python 3.12 "$RUNNER_TEMP/qis-wheel-venv"
+        uv pip install --python "$RUNNER_TEMP/qis-wheel-venv/bin/python" \
+          "$(ls dist/*.whl)" pytest
+
+    - name: Run the offline quickstart against the installed wheel
+      # Execute from outside the checkout.  The script path is repository-owned documentation,
+      # but its qis import and synthetic data resolve entirely through the clean wheel environment.
+      run: |
+        mkdir -p "$RUNNER_TEMP/qis-quickstart-check"
+        cd "$RUNNER_TEMP/qis-quickstart-check"
+        "$RUNNER_TEMP/qis-wheel-venv/bin/python" \
+          "$GITHUB_WORKSPACE/examples/getting_started/offline_quickstart.py" | tee quickstart.txt
+        grep -F "Final NAV: 119.9866" quickstart.txt
+        grep -F "TE=0.0299, IR=-0.2899" quickstart.txt
+
+    - name: Run the shipped suite against the installed wheel
+      run: |
+        mkdir -p "$RUNNER_TEMP/qis-wheel-check"
+        cd "$RUNNER_TEMP/qis-wheel-check"
+        "$RUNNER_TEMP/qis-wheel-venv/bin/python" -m pytest --pyargs qis -q \
+          --import-mode=importlib
+
+  stack-policy:
+    name: stack import boundaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: false
+      - name: Exercise policy regressions
+        run: python .github/scripts/check_stack_imports.py --self-test
+      - name: Check stack imports and optional adapter isolation
+        run: python .github/scripts/check_stack_imports.py
+
+  lowest-dependencies:
+    # Floor resolution is compatibility maintenance, not a verdict on an unrelated edit.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    name: lowest direct dependencies (Python 3.10)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.10"
+      - name: Keep the test environment outside the checkout
+        run: echo "UV_PROJECT_ENVIRONMENT=$RUNNER_TEMP/lowest-dependencies" >> "$GITHUB_ENV"
+      - name: Resolve a fresh lowest-direct test environment
+        # Upgrade ignores lockfile preference; this job never commits its experimental lock.
+        run: uv sync --python 3.10 --resolution lowest-direct --upgrade --group test
+      - name: Record installed versions
+        run: uv pip freeze --python "$UV_PROJECT_ENVIRONMENT/bin/python"
+      - name: Check optional dependencies stay outside package-root import
+        run: uv run --no-sync python .github/scripts/check_stack_imports.py --check-root
+      - name: Test declared dependency floors without live provider credentials
+        run: uv run --no-sync pytest

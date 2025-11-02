@@ -1,0 +1,35 @@
+# SHARED CI CORE v1.0 — T2 — synced 2026-08-22
+name: Documentation
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      online:
+        type: boolean
+        default: false
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  MPLBACKEND: Agg
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+      - name: Sync documentation environment
+        run: uv sync --locked --extra docs
+      - name: Build documentation with the shared profile
+        run: uv run --no-sync python .github/oss_checks.py docs --working-tree --output-dir "$RUNNER_TEMP/oss-docs"
+      - name: Check documentation links
+        if: inputs.online || github.event_name == 'workflow_dispatch'
+        run: uv run --no-sync python -m sphinx -E -W -b linkcheck docs docs/_build/linkcheck
