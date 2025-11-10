@@ -1,0 +1,139 @@
+{
+  "generated_by": "tools/paper_audit.py",
+  "measured_at_commit": "0a9717750a8c466b924cece544c5155a2468c598",
+  "note": "every number paper.md quotes. Regenerate with python tools/paper_audit.py; the package paper-audit test fails when this file and the repository disagree.",
+  "metrics": {
+    "active_months": {
+      "value": 39,
+      "how": "distinct YYYY-MM with at least one commit",
+      "live": false,
+      "paper_phrase": "in 39 of the 46 calendar months"
+    },
+    "ai_coauthored_commits": {
+      "value": 43,
+      "how": "commits carrying a Co-authored-by trailer naming Claude",
+      "live": false,
+      "paper_phrase": null
+    },
+    "ai_coauthored_first_day": {
+      "value": "2026-07-25",
+      "how": "earliest AI co-authored commit",
+      "live": false,
+      "paper_phrase": null
+    },
+    "ai_coauthored_last_day": {
+      "value": "2026-09-18",
+      "how": "latest AI co-authored commit",
+      "live": false,
+      "paper_phrase": null
+    },
+    "backtester_nonblank_lines": {
+      "value": 378,
+      "how": "nonblank lines of src/qis/portfolio/backtester.py",
+      "live": true,
+      "paper_phrase": null
+    },
+    "backtester_physical_lines": {
+      "value": 427,
+      "how": "physical lines of src/qis/portfolio/backtester.py",
+      "live": true,
+      "paper_phrase": "backtester is 427 lines"
+    },
+    "capability_groups": {
+      "value": 14,
+      "how": "len(qis.api.CORE_API)",
+      "live": true,
+      "paper_phrase": "14 capability groups"
+    },
+    "collected_tests": {
+      "value": 3983,
+      "how": "pytest --collect-only -q, summed over files, core install",
+      "live": false,
+      "paper_phrase": null
+    },
+    "commits": {
+      "value": 760,
+      "how": "git rev-list --count HEAD",
+      "live": false,
+      "paper_phrase": null
+    },
+    "consumer_optimalportfolios_call_sites": {
+      "value": 832,
+      "how": "tools/audit_consumers.py at be495a69886b",
+      "live": false,
+      "paper_phrase": "at 832 sites"
+    },
+    "consumer_optimalportfolios_symbols": {
+      "value": 101,
+      "how": "tools/audit_consumers.py at be495a69886b",
+      "live": false,
+      "paper_phrase": "references 101 of its symbols"
+    },
+    "consumer_privateassets_call_sites": {
+      "value": 9,
+      "how": "tools/audit_consumers.py at c03e3eeaf629",
+      "live": false,
+      "paper_phrase": null
+    },
+    "consumer_privateassets_symbols": {
+      "value": 5,
+      "how": "tools/audit_consumers.py at c03e3eeaf629",
+      "live": false,
+      "paper_phrase": null
+    },
+    "consumer_trendfollowing_call_sites": {
+      "value": 441,
+      "how": "tools/audit_consumers.py at 190dbb8dffdf",
+      "live": false,
+      "paper_phrase": "at 441 sites"
+    },
+    "consumer_trendfollowing_symbols": {
+      "value": 87,
+      "how": "tools/audit_consumers.py at 190dbb8dffdf",
+      "live": false,
+      "paper_phrase": "references 87 symbols"
+    },
+    "core_symbols": {
+      "value": 158,
+      "how": "len(qis.api.core_api_names())",
+      "live": true,
+      "paper_phrase": "documented core of 158 symbols"
+    },
+    "exported_module_bindings": {
+      "value": 9,
+      "how": "the subpackage names the wildcard re-exports leave in the namespace",
+      "live": true,
+      "paper_phrase": null
+    },
+    "exported_symbols": {
+      "value": 464,
+      "how": "len(qis.__all__)",
+      "live": true,
+      "paper_phrase": "holds 464 names"
+    },
+    "first_commit_month": {
+      "value": "2022-12",
+      "how": "git log --reverse --format=%ad --date=format:%Y-%m",
+      "live": false,
+      "paper_phrase": null
+    },
+    "last_commit_month": {
+      "value": "2026-09",
+      "how": "git log -1 --format=%ad --date=format:%Y-%m",
+      "live": false,
+      "paper_phrase": null
+    },
+    "paper_body_words": {
+      "value": 1705,
+      "how": "whitespace-separated tokens in paper.md after the YAML front matter",
+      "live": true,
+      "paper_phrase": null
+    },
+    "span_months": {
+      "value": 46,
+      "how": "calendar months from the first commit to the last, inclusive",
+      "live": false,
+      "paper_phrase": null
+    }
+  }
+}
