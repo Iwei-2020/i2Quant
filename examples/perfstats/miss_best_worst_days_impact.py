@@ -1,0 +1,101 @@
+"""
+Quantify how much long-run performance is concentrated in the best /
+worst N days per period.
+
+For each ETF, drops the top / bottom N daily returns within each month
+and recomputes the compounded p.a. return — the canonical demonstration
+that return distributions are dominated by tail days.
+"""
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from typing import List
+from enum import Enum
+import yfinance as yf
+
+
+def add_performance_metric(data: pd.DataFrame) -> List[str]:
+    num_years = (data.index[-1] - data.index[0]).days / 365
+    ratio = data.iloc[-1] / data.iloc[0]
+    compounded_return_pa = ratio ** (1.0 / num_years) - 1
+    print(compounded_return_pa)
+    titles = [f"{key}: {v:0.0%} p.a." for key, v in compounded_return_pa.to_dict().items()]
+    return titles
+
+
+class WoType(Enum):
+    BEST = 1
+    WORST = 2
+    BOTH = 3
+
+
+def perf_wo_best_worst(prices: pd.Series,
+                       freq: str = 'ME',
+                       cut_off: int = 1,
+                       wo_type: WoType = WoType.BEST,
+                       ax: plt.Subplot = None
+                       ) -> pd.DataFrame:
+
+    returns = prices.pct_change()
+    returns_a = returns.groupby(pd.Grouper(freq=freq))
+
+    wo_best_returns = []
+    wo_worst_returns = []
+    for key, data in returns_a:
+        data = data.sort_values()  # sort by max returns
+        wo_best = data.copy()
+        wo_best.iloc[-cut_off:] = 0.0
+        wo_best_returns.append(wo_best.sort_index())  # sort back
+        wo_worst = data.copy()
+        wo_worst.iloc[:cut_off] = 0.0
+        #wo_worst.iloc[-cut_off:] = 0.0
+        wo_worst_returns.append(wo_worst.sort_index())  # sort back
+
+    wo_best_returns = pd.concat(wo_best_returns, axis=0)
+    wo_worst_returns = pd.concat(wo_worst_returns, axis=0)
+
+    wo_best_perf = wo_best_returns.add(1.0).cumprod(axis=0).multiply(prices.iloc[0])
+    wo_worst_perf = wo_worst_returns.add(1.0).cumprod(axis=0).multiply(prices.iloc[0])
+
+    if wo_type == WoType.BEST:
+        joint_data = pd.concat([prices, wo_best_perf.rename('W/O Best')], axis=1)
+
+    elif wo_type == WoType.WORST:
+        joint_data = pd.concat([prices, wo_best_perf.rename('W/O Best'), wo_worst_perf.rename('W/O Worst')], axis=1)
+
+    else:
+        joint_data = pd.concat([prices, wo_worst_perf.rename('W/O Best and Worst') ], axis=1)
+
+    #     ppd.plot_prices(prices=joint_data)
+    joint_data.columns = add_performance_metric(joint_data)
+    sns.lineplot(data=joint_data, ax=ax)
+
+    return joint_data
+
+
+class Locals(Enum):
+    PERF1 = 1
+
+
+def run_local(local: Locals):
+    """Run local tests for development and debugging purposes.
+
+    These are integration tests that download real data and generate reports.
+    Use for quick verification during development.
+    """
+
+    ticker = 'SPY'
+    prices = yf.download(ticker, start="2003-12-31", end=None, ignore_tz=True, auto_adjust=True)['Close'].rename(ticker)
+
+    freq = 'ME'
+    wo_type = WoType.BEST
+    if local == Locals.PERF1:
+        fig, ax = plt.subplots(1, 1, figsize=(10, 10), tight_layout=True)
+        perf_wo_best_worst(prices=prices, freq=freq, wo_type=WoType.WORST, ax=ax)
+
+    plt.show()
+
+
+if __name__ == '__main__':
+
+    run_local(local=Locals.PERF1)
