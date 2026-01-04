@@ -1,0 +1,1117 @@
+"""
+path management for saving and reading from local drive
+use settings.yaml to set local directories
+
+Content of settings.yaml:
+RESOURCE_PATH:
+  'C:\\your_folder\\'
+UNIVERSE_PATH:
+  'C:\\your_folder\\'
+OUTPUT_PATH:
+  'C:\\your_folder\\'
+# optional; the key qis.sql_engine.get_engine reads by default
+AWS_POSTGRES:
+  "postgresql://user:password@database:port"
+"""
+import os
+import functools
+import platform
+import time
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from os import listdir
+from os.path import isfile, join
+from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple, Union, Literal
+from matplotlib.backends.backend_pdf import PdfPages
+from enum import Enum
+
+from qis.local_path import get_paths, get_resource_path, get_output_path
+
+
+""""
+Path specifications
+"""
+LOCAL_PATHS = get_paths()
+RESOURCE_PATH = LOCAL_PATHS['RESOURCE_PATH']
+UNIVERSE_PATH = LOCAL_PATHS['UNIVERSE_PATH']
+OUTPUT_PATH = LOCAL_PATHS['OUTPUT_PATH']
+
+
+DATE_FORMAT = '%Y%m%d_%H%M'
+INDEX_COLUMN = 'timestamp'  # for Postresql
+
+
+class FileData(NamedTuple):
+    extension: str
+    folder: Union[str, None]
+
+
+class FileTypes(FileData, Enum):
+    FIGURE = FileData(extension='.png', folder='figures')
+    PNG = FileData(extension='.PNG', folder='figures')
+    EPS = FileData(extension='.eps', folder='figures')
+    SVG = FileData(extension='.svg', folder='figures')
+    CSV = FileData(extension='.csv', folder='csv')
+    CSV_GZ = FileData(extension='.csv.gz', folder='csv')
+    FEATHER = FileData(extension='.feather', folder='feather')
+    EXCEL = FileData(extension='.xlsx', folder='excel')
+    PPTX = FileData(extension='.pptx', folder='pptx')
+    WORD = FileData(extension='.docx', folder=None)
+    PDF = FileData(extension='.pdf', folder=None)
+    TXT = FileData(extension='.txt', folder='txt')
+    PARQUET = FileData(extension='.parquet', folder='parquet')
+    ZIP = FileData(extension='.zip', folder=None)
+    HTML = FileData(extension='.html', folder=None)
+
+
+def join_file_name_parts(parts: List[str]) -> str:
+    """
+    set standard for joining parts of file name
+    """
+    return '_'.join(parts)
+
+
+def get_local_file_path(file_name: Optional[str],
+                        file_type: Optional[FileTypes] = None,
+                        local_path: Optional[str] = OUTPUT_PATH,
+                        folder_name: str = None,
+                        key: str = None,
+                        add_current_date: bool = False,
+                        date_format: str = '%Y%m%d_%H%M'
+                        ) -> str:
+    """
+    file data management is organised as:
+    file_path = RESOURCE_PATH/folder_name/file_name+file_type.value
+    default value without optional arguments will be:
+    file_path = RESOURCE_PATH/file_name.file_type.value
+
+    for datasets, we can define datasets keys so the file paths are:
+    file_path = RESOURCE_PATH/folder_name/file_name+_key+file_type.value
+    or if file_name is None:
+    file_path = RESOURCE_PATH/folder_name/key+file_type.value
+
+    if local_path is not None: file_path=local_path
+    if local_path in not None and file_name and file_type is passed: file_path=local_path//file_name+file_type.value
+    if local_path in not None and file_name is None and key is not None and file_type is passed: file_path=local_path//key+file_type.value
+    if local_path in not None and file_name and key and file_type is passed: file_path=local_path//file_name_key+file_type.value
+    """
+
+    # explicit local_path=None falls back to caller's current working directory
+    if local_path is None:
+        local_path = ''
+
+    if local_path is not None and folder_name is not None:
+        local_path = join(local_path, folder_name)
+
+    if add_current_date and file_name is not None:  # only for output files
+        file_name = join_file_name_parts([file_name, pd.Timestamp.now().strftime(date_format)])
+
+    if file_name is not None:
+        if key is not None:
+            if file_name is None:
+                file_name = key
+            else:
+                file_name = join_file_name_parts([file_name, key])
+        if file_type is not None:  # by convention no file folder
+            file_name = file_name + file_type.extension
+        file_path = join(local_path, file_name)
+
+    elif file_name is None and key is not None:
+        file_name = key
+        if file_type is not None:
+            file_name = file_name + file_type.extension
+        file_path = join(local_path, file_name)
+
+    else:
+        file_path = local_path
+
+    return file_path
+
+
+def timer(func):
+    """
+    decorator printing the wall-clock runtime of the decorated function.
+
+    Runtimes under a minute print in seconds, longer ones in minutes and seconds. Intended for the
+    long-running research entry points - a rolling backtest, a covariance sweep - where the cost of
+    a change is worth seeing without reaching for a profiler.
+
+    Args:
+        func: the function to wrap
+
+    Returns:
+        the wrapped function, which returns whatever ``func`` returns
+    """
+    @functools.wraps(func)
+    def wrapper_timer(*args, **kwargs):
+        start_time = time.perf_counter()    # 1
+        value = func(*args, **kwargs)
+        end_time = time.perf_counter()      # 2
+        run_time = end_time - start_time    # 3
+        if run_time < 60.0:
+            print(f"Finished {func.__name__!r} in {run_time:.4f} secs")
+        else:
+            minuts = np.floor(run_time/60.0)
+            secs = run_time - 60.0*minuts
+            print(f"Finished {func.__name__!r} in {minuts:.0f}m {secs:.0f}secs")
+        return value
+    return wrapper_timer
+
+
+"""
+Shared helpers for save_* functions
+"""
+
+
+_SHEET_NAME_MAX = 31
+_SHEET_NAME_BAD = "[]:*?/\\"
+
+
+def _coerce_to_df(obj, label: str) -> Optional[pd.DataFrame]:
+    """Coerce Series->DataFrame; warn and return None for unsupported/None inputs."""
+    if obj is None:
+        return None
+    if isinstance(obj, pd.DataFrame):
+        return obj
+    if isinstance(obj, pd.Series):
+        warnings.warn(f"{label!r}: Series converted to DataFrame")
+        return obj.to_frame()
+    warnings.warn(f"{label!r}: unsupported type {type(obj).__name__}; skipped")
+    return None
+
+
+def _sanitize_sheet_name(name, taken: set) -> str:
+    """Make `name` a valid Excel sheet name (<=31 chars, no []:*?/\\, unique)."""
+    s = str(name)
+    for bad in _SHEET_NAME_BAD:
+        s = s.replace(bad, "_")
+    s = s[:_SHEET_NAME_MAX]
+    if s != str(name):
+        warnings.warn(f"Sheet name {name!r} sanitized to {s!r}")
+    if s in taken:
+        base = s[: _SHEET_NAME_MAX - 4]
+        i = 2
+        while f"{base}_{i}" in taken:
+            i += 1
+        new = f"{base}_{i}"
+        warnings.warn(f"Duplicate sheet name {s!r}; using {new!r}")
+        s = new
+    taken.add(s)
+    return s
+
+
+def _iter_named(data, sheet_names) -> Iterable[Tuple[str, object]]:
+    """Yield (raw_name, obj) pairs for any of the accepted input shapes."""
+    if isinstance(data, dict):
+        if sheet_names is not None:
+            warnings.warn("sheet_names ignored for dict input; using dict keys")
+        yield from data.items()
+    elif isinstance(data, list):
+        if sheet_names is None:
+            names = [f"Sheet {i + 1}" for i in range(len(data))]
+        elif isinstance(sheet_names, str):
+            raise TypeError("sheet_names must be a list when data is a list")
+        elif len(sheet_names) < len(data):
+            raise ValueError(
+                f"sheet_names has {len(sheet_names)} entries, data has {len(data)}"
+            )
+        else:
+            names = sheet_names
+        yield from zip(names, data)
+    else:
+        if isinstance(sheet_names, str):
+            name = sheet_names
+        elif isinstance(sheet_names, list) and sheet_names:
+            name = sheet_names[0]
+        else:
+            name = "Sheet1"
+        yield name, data
+
+
+"""
+Pandas to/from Excel core
+"""
+
+
+def delocalize_df(data: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(data.index, pd.DatetimeIndex):
+        data.index = data.index.tz_localize(None)
+    return data
+
+
+def save_df_to_excel(data: Union[pd.DataFrame, List[pd.DataFrame], Dict[str, pd.DataFrame]],
+                     file_name: str,
+                     local_path: Optional[str] = None,
+                     mode: Literal['w', 'a'] = 'w',
+                     folder_name: str = None,
+                     key: str = None,
+                     add_current_date: bool = False,
+                     sheet_names: Union[List[str], str] = None,
+                     transpose: bool = False,
+                     if_sheet_exists: Optional[Literal['error', 'new', 'replace', 'overlay']] = 'replace'
+                     ) -> str:
+    """
+    pandas or list of pandas to one excel
+    if_sheet_exists only for append mode
+    mode = w: write new file
+    mode = a: append to existing file
+    """
+    if add_current_date:
+        file_name = f"{file_name}_{pd.Timestamp.now().strftime(DATE_FORMAT)}"
+
+    file_path = get_local_file_path(file_name=file_name,
+                                    file_type=FileTypes.EXCEL,
+                                    local_path=local_path,
+                                    folder_name=folder_name,
+                                    key=key)
+
+    # Resolve + validate everything before opening the writer so we don't leave
+    # a half-written / empty workbook behind on error.
+    taken: set = set()
+    frames: List[Tuple[str, pd.DataFrame]] = []
+    for raw_name, obj in _iter_named(data, sheet_names):
+        df = _coerce_to_df(obj, str(raw_name))
+        if df is None:
+            continue
+        df = delocalize_df(df)
+        if transpose:
+            df = df.T
+        frames.append((_sanitize_sheet_name(raw_name, taken), df))
+
+    if not frames:
+        raise ValueError("No DataFrames to write")
+
+    writer_kwargs = {"engine": "openpyxl", "mode": mode}
+    if mode == "a":
+        writer_kwargs["if_sheet_exists"] = if_sheet_exists
+
+    with pd.ExcelWriter(file_path, **writer_kwargs) as writer:
+        for name, df in frames:
+            df.to_excel(writer, sheet_name=name)
+
+    return file_path
+
+
+def load_df_from_excel(file_name: str,
+                       sheet_name: str = 'Sheet1',
+                       local_path: Optional[str] = None,
+                       folder_name: str = None,
+                       key: str = None,
+                       is_index: bool = True,
+                       delocalize: bool = False,  # excel data may have local time which are unwanted
+                       header: int = 0,
+                       preserve_header0_columns: bool = True
+                       ) -> pd.DataFrame:
+    """
+    read one sheet of an Excel workbook into a DataFrame.
+
+    Args:
+        file_name: base file name without extension
+        sheet_name: sheet to read
+        local_path: directory to read from
+        folder_name: subdirectory under ``local_path``
+        key: suffix appended to ``file_name``
+        is_index: read the first column as the index
+        delocalize: drop the timezone from a datetime index. Excel often carries a local timezone
+            that is an artefact of the machine that wrote the file, not of the data
+        header: row number of the header, zero-based
+        preserve_header0_columns: when ``header`` is not 0, keep the names from row 0 as the column
+            labels, so a two-row header does not lose the names in favour of the units
+
+    Returns:
+        the sheet as a frame
+
+    Raises:
+        FileNotFoundError: if the workbook does not exist
+    """
+    file_path = get_local_file_path(file_name=file_name,
+                                    file_type=FileTypes.EXCEL,
+                                    local_path=local_path,
+                                    folder_name=folder_name,
+                                    key=key)
+    if os.path.isfile(file_path):
+        excel_reader = pd.ExcelFile(file_path, engine='openpyxl')
+    else:
+        raise FileNotFoundError(f"file data {file_path} nor found")
+
+    index_col = 0 if is_index else None
+    df = excel_reader.parse(sheet_name=sheet_name, index_col=index_col, header=header)
+    if preserve_header0_columns and header != 0:
+        header_names = excel_reader.parse(sheet_name=sheet_name, index_col=index_col, nrows=0).columns.tolist()
+        df.columns = header_names
+
+    if is_index and delocalize:
+        df = delocalize_df(df)
+
+    return df
+
+
+def save_df_dict_to_excel(datasets: Dict[Union[str, Enum, NamedTuple], pd.DataFrame],
+                          file_name: str,
+                          local_path: Optional[str] = None,
+                          mode: Literal['w', 'a'] = 'w',
+                          folder_name: str = None,
+                          key: str = None,
+                          add_current_date: bool = False,
+                          delocalize: bool = False
+                          ) -> str:
+    """
+    dictionary of pandas to same Excel with dfs as separate sheets
+    w adds/replaces with new excel; a appends to exisiting
+    """
+    if add_current_date:
+        file_name = f"{file_name}_{pd.Timestamp.now().strftime(DATE_FORMAT)}"
+
+    file_path = get_local_file_path(file_name=file_name,
+                                    file_type=FileTypes.EXCEL,
+                                    local_path=local_path,
+                                    folder_name=folder_name,
+                                    key=key)
+
+    taken: set = set()
+    frames: List[Tuple[str, pd.DataFrame]] = []
+    for raw_name, obj in datasets.items():
+        df = _coerce_to_df(obj, str(raw_name))
+        if df is None:
+            continue
+        if delocalize:
+            df = delocalize_df(df)
+        frames.append((_sanitize_sheet_name(raw_name, taken), df))
+
+    if not frames:
+        raise ValueError("No DataFrames to write")
+
+    with pd.ExcelWriter(file_path, engine='openpyxl', mode=mode) as writer:
+        for name, df in frames:
+            df.to_excel(writer, sheet_name=name)
+
+    return file_path
+
+
+def load_df_dict_from_excel(file_name: str,
+                            dataset_keys: Optional[List[Union[str, Enum, NamedTuple]]] = None,
+                            local_path: Optional[str] = None,
+                            folder_name: str = None,
+                            key: str = None,
+                            is_index: bool = True,
+                            delocalize: bool = False,
+                            tz: str = None
+                            ) -> Dict[str, pd.DataFrame]:
+    """
+    loag Excel sheets to pandas dict
+    dataset_keys = None, it will read all sheets
+    """
+    file_path = get_local_file_path(file_name=file_name,
+                                    file_type=FileTypes.EXCEL,
+                                    local_path=local_path,
+                                    folder_name=folder_name,
+                                    key=key)
+
+    if os.path.isfile(file_path):
+        excel_reader = pd.ExcelFile(file_path, engine='openpyxl')
+    else:
+        raise FileNotFoundError(f"file data {file_path} not found")
+    if dataset_keys is None:
+        dataset_keys = excel_reader.sheet_names
+    index_col = 0 if is_index else None
+    pandas_dict = {}
+    for key in dataset_keys:
+        try:
+            df = excel_reader.parse(sheet_name=key, index_col=index_col)
+        except Exception:
+            raise TypeError(f"sheet_name data {key} nor found")
+        if delocalize:
+            df = delocalize_df(df)
+        if tz is not None:
+            df.index = df.index.tz_localize(tz)
+        pandas_dict[key] = df
+
+    return pandas_dict
+
+
+"""
+Pandas to/from CSV core
+"""
+
+
+def save_df_to_csv(df: pd.DataFrame,
+                   file_name: str = None,
+                   folder_name: str = None,
+                   key: str = None,
+                   add_current_date: bool = False,
+                   local_path: Optional[str] = None,
+                   file_type: FileTypes = FileTypes.CSV
+                   ) -> None:
+    """
+    write one DataFrame to a CSV under the managed path layout.
+
+    The path is assembled rather than passed: ``local_path/folder_name/file_name_key.csv``. That
+    keeps a dataset's location in one place, so a caller names the dataset instead of building a
+    path.
+
+    Args:
+        df: frame to write. A Series is promoted to a one-column frame
+        file_name: base file name without extension
+        folder_name: subdirectory under ``local_path``
+        key: suffix appended to ``file_name``, for one file per key
+        add_current_date: append the current date to the file name, so successive runs do not
+            overwrite each other
+        local_path: directory to write to. None writes to the working directory
+        file_type: CSV or CSV_GZ
+
+    Returns:
+        None
+
+    Raises:
+        ValueError: if ``file_type`` is neither CSV nor CSV_GZ, or if ``df`` is empty
+    """
+    if file_type not in (FileTypes.CSV, FileTypes.CSV_GZ):
+        raise ValueError(f"file_type must be CSV or CSV_GZ, got {file_type}")
+    df = _coerce_to_df(df, label=file_name or key or "dataframe")
+    if df is None:
+        raise ValueError("No DataFrame to write")
+
+    if add_current_date:
+        file_name = f"{file_name}_{pd.Timestamp.now().strftime(DATE_FORMAT)}"
+
+    file_path = get_local_file_path(file_name=file_name,
+                                    file_type=file_type,
+                                    local_path=local_path,
+                                    folder_name=folder_name,
+                                    key=key)
+    df.to_csv(path_or_buf=file_path)
+
+
+def load_df_from_csv(file_name: Optional[str] = None,
+                     local_path: Optional[str] = None,
+                     folder_name: str = None,
+                     key: str = None,
+                     is_index: bool = True,
+                     parse_dates: bool = True,
+                     dayfirst: Optional[bool] = None,
+                     tz: str = None,
+                     drop_duplicated: bool = False,
+                     file_type: FileTypes = FileTypes.CSV,
+                     float_precision: Optional[str] = None
+                     ) -> pd.DataFrame:
+    """
+    read one DataFrame from a CSV under the managed path layout.
+
+    Args:
+        file_name: base file name without extension
+        local_path: directory to read from. None resolves to the working directory
+        folder_name: subdirectory under ``local_path``
+        key: suffix appended to ``file_name``, for one file per key
+        is_index: read the first column as the index. False leaves a RangeIndex
+        parse_dates: parse the index as dates. Applies only when ``is_index``
+        dayfirst: interpret ambiguous dates as day-first. None leaves it to pandas, which is
+            month-first, so set it True for European-formatted files
+        tz: timezone to localise the index to. None leaves it naive
+        drop_duplicated: drop duplicated index entries, keeping the first
+        file_type: CSV or CSV_GZ
+        float_precision: float converter pandas reads the file with. None uses pandas' default
+            C converter, which is fast and NOT correctly rounded: a written-then-read float can
+            differ from the original in its last bit. Pass 'round_trip' when the read has to
+            return exactly what was written, e.g. when a stored panel is compared against the
+            frame that produced it
+
+    Returns:
+        the frame, with a DatetimeIndex when ``is_index`` and ``parse_dates``
+
+    Raises:
+        ValueError: if ``file_type`` is neither CSV nor CSV_GZ
+    """
+    if file_type not in (FileTypes.CSV, FileTypes.CSV_GZ):
+        raise ValueError(f"file_type must be CSV or CSV_GZ, got {file_type}")
+    file_path = get_local_file_path(file_name=file_name,
+                                    file_type=file_type,
+                                    local_path=local_path,
+                                    folder_name=folder_name,
+                                    key=key)
+    if is_index:
+        index_col = 0
+        parse_dates = parse_dates
+    else:
+        index_col = None
+        parse_dates = None
+
+    if os.path.isfile(file_path):
+        try:
+            df = pd.read_csv(filepath_or_buffer=file_path,
+                             index_col=index_col,
+                             parse_dates=parse_dates,
+                             dayfirst=dayfirst,
+                             float_precision=float_precision)
+
+        except UnicodeDecodeError:  # try without index
+            df = pd.read_csv(filepath_or_buffer=file_path,
+                             float_precision=float_precision)
+    else:
+        raise FileNotFoundError(f"not found {file_name} with file_path={file_path}")
+
+    if drop_duplicated:
+        df = df.loc[~df.index.duplicated(keep='first')]
+
+    if not df.empty:
+        if tz is not None:
+            if df.index.tzinfo is not None:
+                df.index = df.index.tz_convert(tz=tz)
+            else:
+                df.index = df.index.tz_localize(tz=tz)
+
+    return df
+
+
+def update_df_in_csv(df: pd.DataFrame,
+                     file_name: str = None,
+                     folder_name: str = None,
+                     key: str = None,
+                     local_path: Optional[str] = None,
+                     keep: Optional[Literal['first', 'last']] = None,
+                     file_type: FileTypes = FileTypes.CSV
+                     ) -> None:
+    """
+    update csv file with new rows: if the file exists, load the existing data,
+    concatenate with `df`, optionally drop duplicate index entries via `keep`,
+    and rewrite the file. If the file does not exist, write `df` as new file.
+    """
+    if file_type not in (FileTypes.CSV, FileTypes.CSV_GZ):
+        raise ValueError(f"file_type must be CSV or CSV_GZ, got {file_type}")
+    df = _coerce_to_df(df, label=file_name or key or "dataframe")
+    if df is None:
+        raise ValueError("No DataFrame to update")
+
+    # check if file exist
+    file_path = get_local_file_path(file_name=file_name,
+                                    file_type=file_type,
+                                    local_path=local_path,
+                                    folder_name=folder_name,
+                                    key=key)
+    if os.path.isfile(file_path):  # append using format of old file
+        old_df = load_df_from_csv(file_name=file_name,
+                                  local_path=local_path,
+                                  folder_name=folder_name,
+                                  key=key,
+                                  file_type=file_type)
+        df = pd.concat([old_df, df], axis=0)
+        if keep is not None:
+            df = df.loc[~df.index.duplicated(keep=keep)]
+
+    save_df_to_csv(df=df,
+                   file_name=file_name,
+                   folder_name=folder_name,
+                   key=key,
+                   local_path=local_path,
+                   file_type=file_type)
+
+
+def save_df_dict_to_csv(datasets: Dict[Union[str, Enum, NamedTuple], pd.DataFrame],
+                        file_name: Optional[str] = None,
+                        local_path: Optional[str] = None,
+                        folder_name: str = None,
+                        add_current_date: bool = False,
+                        file_type: FileTypes = FileTypes.CSV
+                        ) -> None:
+    """
+    write a dict of DataFrames, one CSV per key.
+
+    Args:
+        datasets: key to frame. An Enum key is used by its value
+        file_name: base file name shared by every key
+        local_path: directory to write to
+        folder_name: subdirectory under ``local_path``
+        add_current_date: append the current date to the file name
+        file_type: CSV or CSV_GZ
+
+    Returns:
+        None
+
+    Raises:
+        ValueError: if ``file_type`` is neither CSV nor CSV_GZ
+    """
+    if file_type not in (FileTypes.CSV, FileTypes.CSV_GZ):
+        raise ValueError(f"file_type must be CSV or CSV_GZ, got {file_type}")
+    if add_current_date:
+        file_name = f"{file_name}_{pd.Timestamp.now().strftime(DATE_FORMAT)}"
+
+    for raw_key, obj in datasets.items():
+        df = _coerce_to_df(obj, str(raw_key))
+        if df is None:
+            continue
+        file_path = get_local_file_path(file_name=file_name,
+                                        file_type=file_type,
+                                        local_path=local_path,
+                                        folder_name=folder_name,
+                                        key=raw_key)
+        df.to_csv(path_or_buf=file_path)
+
+
+def load_df_dict_from_csv(dataset_keys: List[Union[str, Enum, NamedTuple]],
+                          file_name: Optional[str],
+                          local_path: Optional[str] = None,
+                          folder_name: str = None,
+                          is_index: bool = True,
+                          dayfirst: Optional[bool] = None,  # will give priority to formats where day come first
+                          force_not_found_error: bool = False,
+                          file_type: FileTypes = FileTypes.CSV,
+                          float_precision: Optional[str] = None
+                          ) -> Dict[str, pd.DataFrame]:
+    """
+    read a dict of DataFrames, one CSV per key.
+
+    The inverse of :func:`save_df_dict_to_csv`. One file per key rather than one file with a key
+    column, so each dataset can be read without loading the rest.
+
+    Args:
+        dataset_keys: keys to read. An Enum member is used by its value, so an Enum can name the
+            datasets instead of string literals
+        file_name: base file name shared by every key
+        local_path: directory to read from
+        folder_name: subdirectory under ``local_path``
+        is_index: read the first column of each file as a parsed date index
+        dayfirst: interpret ambiguous dates as day-first
+        force_not_found_error: raise when a key's file is absent. False skips it, so the returned
+            dict may be smaller than ``dataset_keys``
+        file_type: CSV or CSV_GZ
+        float_precision: float converter pandas reads the files with. None uses pandas' default
+            C converter, which is fast and NOT correctly rounded. Pass 'round_trip' when the read
+            has to return exactly what ``save_df_dict_to_csv`` wrote, which is what a stored
+            panel compared against its source frame needs
+
+    Returns:
+        key to frame, containing only the keys whose files were found unless
+        ``force_not_found_error``
+
+    Raises:
+        ValueError: if ``file_type`` is neither CSV nor CSV_GZ
+        FileNotFoundError: if a key's file is absent and ``force_not_found_error``
+    """
+    if file_type not in (FileTypes.CSV, FileTypes.CSV_GZ):
+        raise ValueError(f"file_type must be CSV or CSV_GZ, got {file_type}")
+    index_col = 0 if is_index else None
+    pandas_dict = {}
+    for key in dataset_keys:
+        file_path = get_local_file_path(file_name=file_name,
+                                        file_type=file_type,
+                                        local_path=local_path,
+                                        folder_name=folder_name,
+                                        key=key)
+        if os.path.isfile(file_path):
+            data = pd.read_csv(filepath_or_buffer=file_path,
+                               index_col=index_col,
+                               parse_dates=True,
+                               dayfirst=dayfirst,
+                               float_precision=float_precision)
+            pandas_dict[key] = data
+        else:
+            message = f"file data {file_path}, {key} not found"
+            if force_not_found_error:
+                raise FileNotFoundError(message)
+            else:
+                print(message)
+
+    return pandas_dict
+
+
+#############################################################
+#  Pandas to/from feather
+#############################################################
+
+
+#############################################################
+#  Dataframe to/from feather
+#############################################################
+
+def save_df_to_feather(df: pd.DataFrame,
+                       file_name: Optional[str] = None,
+                       local_path: Optional[str] = None,
+                       folder_name: str = None,
+                       key: str = None,
+                       index_col: Optional[str] = INDEX_COLUMN
+                       ) -> None:
+    """
+    save df to feather files
+    index_col stands for the index: needs to be reset when saving and put back when loading
+    """
+    df = _coerce_to_df(df, label=file_name or key or "dataframe")
+    if df is None:
+        raise ValueError("No DataFrame to write")
+
+    file_path = get_local_file_path(file_name=file_name,
+                                    file_type=FileTypes.FEATHER,
+                                    local_path=local_path,
+                                    folder_name=folder_name,
+                                    key=key)
+    if index_col is not None and index_col not in df.columns:  # index is unique and preserved
+        df = df.reset_index(names=index_col)
+    else:  # drop to avoid entering extra field when loading back
+        df = df.reset_index(drop=True)
+    df.to_feather(path=file_path)
+
+
+def append_df_to_feather(df: pd.DataFrame,
+                         file_name: str = None,
+                         folder_name: str = None,
+                         key: str = None,
+                         local_path: Optional[str] = None,
+                         keep: Optional[Literal['first', 'last']] = None,
+                         index_col: Optional[str] = INDEX_COLUMN
+                         ) -> pd.DataFrame:
+    """
+    append csv file
+    """
+    df = _coerce_to_df(df, label=file_name or key or "dataframe")
+    if df is None:
+        raise ValueError("No DataFrame to append")
+
+    # check if file exist
+    file_path = get_local_file_path(file_name=file_name,
+                                    file_type=FileTypes.FEATHER,
+                                    local_path=local_path,
+                                    folder_name=folder_name,
+                                    key=key)
+    if os.path.isfile(file_path):  # append using format of old file
+        old_df = load_df_from_feather(file_name=file_name,
+                                      local_path=local_path,
+                                      folder_name=folder_name,
+                                      key=key,
+                                      index_col=index_col)
+        df = pd.concat([old_df, df], axis=0)
+        if keep is not None:
+            df = df.loc[~df.index.duplicated(keep=keep)]
+
+    save_df_to_feather(df=df,
+                       file_name=file_name,
+                       folder_name=folder_name,
+                       key=key,
+                       local_path=local_path,
+                       index_col=index_col)
+    return df
+
+
+def load_df_from_feather(file_name: Optional[str] = None,
+                         local_path: Optional[str] = None,
+                         folder_name: str = None,
+                         key: str = None,
+                         index_col: Optional[str] = INDEX_COLUMN
+                         ) -> pd.DataFrame:
+    """
+    load dfs from feather files
+    """
+    file_path = get_local_file_path(file_name=file_name,
+                                    file_type=FileTypes.FEATHER,
+                                    local_path=local_path,
+                                    folder_name=folder_name,
+                                    key=key)
+    if os.path.isfile(file_path):  # append using format of old file
+        df = pd.read_feather(file_path)
+    else:
+        raise FileNotFoundError(f"not found {file_name} with file_path={file_path}")
+
+    if index_col is not None and index_col in df.columns:
+        df[index_col] = pd.to_datetime(df[index_col])
+        df = df.set_index(index_col)
+    return df
+
+
+@timer
+def save_df_dict_to_feather(dfs: Dict[Union[str, Enum, NamedTuple], pd.DataFrame],
+                            file_name: Optional[str] = None,
+                            local_path: Optional[str] = None,
+                            folder_name: str = None,
+                            index_col: Optional[str] = INDEX_COLUMN
+                            ) -> None:
+    """
+    pandas dict to csv files
+    """
+    for raw_key, obj in dfs.items():
+        df = _coerce_to_df(obj, str(raw_key))
+        if df is None:
+            continue
+        file_path = get_local_file_path(file_name=file_name,
+                                        file_type=FileTypes.FEATHER,
+                                        local_path=local_path,
+                                        folder_name=folder_name,
+                                        key=raw_key)
+        if index_col is not None and index_col not in df.columns:
+            df = df.reset_index(names=index_col)
+        else:
+            df = df.reset_index(drop=True)
+        df.to_feather(path=file_path)
+
+
+def load_df_dict_from_feather(dataset_keys: List[Union[str, Enum, NamedTuple]],
+                              file_name: Optional[str],
+                              local_path: Optional[str] = None,
+                              folder_name: str = None,
+                              force_not_found_error: bool = False,
+                              index_col: Optional[str] = INDEX_COLUMN
+                              ) -> Dict[str, pd.DataFrame]:
+    """
+    pandas dict from csv files
+    """
+    pandas_dict = {}
+    for key in dataset_keys:
+        file_path = get_local_file_path(file_name=file_name,
+                                        file_type=FileTypes.FEATHER,
+                                        local_path=local_path,
+                                        folder_name=folder_name,
+                                        key=key)
+        if os.path.isfile(file_path):
+            df = pd.read_feather(file_path)
+            if index_col is not None and index_col in df.columns:
+                df.index = pd.to_datetime(df[index_col])
+                df = df.set_index(index_col)
+            pandas_dict[key] = df
+        else:
+            message = f"file data {file_path}, {key} not found"
+            if force_not_found_error:
+                raise FileNotFoundError(message)
+            else:
+                print(message)
+
+    return pandas_dict
+
+
+"""
+Pandas to/from parquet core
+"""
+
+
+def save_df_to_parquet(df: pd.DataFrame,
+                       file_name: str,
+                       folder_name: Optional[str] = None,
+                       key: Optional[str] = None,
+                       local_path: Optional[str] = None,
+                       delocalize: bool = False
+                       ) -> None:
+    """
+    pandas to parquet
+    """
+    df = _coerce_to_df(df, label=file_name or key or "dataframe")
+    if df is None:
+        raise ValueError("No DataFrame to write")
+
+    file_path = get_local_file_path(file_name=file_name,
+                                    file_type=FileTypes.PARQUET,
+                                    local_path=local_path,
+                                    folder_name=folder_name,
+                                    key=key)
+    if delocalize:
+        df = delocalize_df(df)
+    df.to_parquet(path=file_path)
+
+
+def load_df_from_parquet(file_name: Optional[str],
+                         folder_name: str = None,
+                         key: Optional[str] = None,
+                         local_path: Optional[str] = None,
+                         delocalize: bool = False
+                         ) -> pd.DataFrame:
+    """
+    pandas from parquet
+    """
+    file_path = get_local_file_path(file_name=file_name,
+                                    file_type=FileTypes.PARQUET,
+                                    local_path=local_path,
+                                    folder_name=folder_name,
+                                    key=key)
+    if os.path.isfile(file_path):
+        df = pd.read_parquet(path=file_path)
+    else:
+        raise FileNotFoundError(f"not found {file_name} with path={file_path}")
+    if delocalize:
+        df = delocalize_df(df)
+
+    return df
+
+
+def save_df_dict_to_parquet(datasets: Dict[Union[str, Enum, NamedTuple], pd.DataFrame],
+                            file_name: Optional[str] = None,
+                            folder_name: str = None,
+                            local_path: Optional[str] = None,
+                            delocalize: bool = False
+                            ) -> None:
+    """
+    pandas dict to parquet files
+    """
+    for raw_key, obj in datasets.items():
+        df = _coerce_to_df(obj, str(raw_key))
+        if df is None:
+            continue
+        file_path = get_local_file_path(file_name=file_name,
+                                        file_type=FileTypes.PARQUET,
+                                        local_path=local_path,
+                                        folder_name=folder_name,
+                                        key=raw_key)
+        if delocalize:
+            df = delocalize_df(df)
+        df.to_parquet(path=file_path)
+
+
+def load_df_dict_from_parquet(dataset_keys: List[Union[str, Enum, NamedTuple]],
+                              file_name: Optional[str],
+                              folder_name: str = None,
+                              local_path: Optional[str] = None,
+                              force_not_found_error: bool = False
+                              ) -> Dict[str, pd.DataFrame]:
+    """
+    pandas dict from parquet files
+    """
+    pandas_dict = {}
+    for key in dataset_keys:
+        file_path = get_local_file_path(file_name=file_name,
+                                        file_type=FileTypes.PARQUET,
+                                        local_path=local_path,
+                                        folder_name=folder_name,
+                                        key=key)
+        if os.path.isfile(file_path):
+            pandas_dict[key] = pd.read_parquet(path=file_path)
+        else:
+            message = f"file data {file_name}, {key} not found"
+            if force_not_found_error:
+                raise FileNotFoundError(message)
+            else:
+                print(message)
+
+    return pandas_dict
+
+
+"""
+For pdfs
+"""
+
+
+def get_pdf_path(file_name: str,
+                 local_path: Union[None, str] = None,
+                 add_current_date: bool = True
+                 ) -> str:
+
+    if add_current_date:
+        file_name = join_file_name_parts([file_name, pd.Timestamp.now().strftime(DATE_FORMAT)])
+
+    file_path = get_local_file_path(file_name=file_name, file_type=FileTypes.PDF, local_path=local_path)
+
+    return file_path
+
+
+def get_all_folder_files(folder_path: str):
+    files = [f for f in listdir(folder_path) if isfile(join(folder_path, f))]
+    print(files)
+
+
+
+"""
+Figure files
+"""
+
+
+def save_fig(fig: plt.Figure,
+             file_name: str,
+             local_path: Optional[str] = None,
+             dpi: int = 300,
+             file_type=FileTypes.PNG,
+             add_current_date: bool = False,
+             **kwargs
+             ) -> str:
+    """
+    write a matplotlib figure to an image or vector file.
+
+    Args:
+        fig: figure to write
+        file_name: base file name without extension
+        local_path: directory to write to. None writes to the working directory
+        dpi: resolution. Relevant to PNG; the vector formats use it only for rasterised elements
+        file_type: PNG, EPS, SVG or PDF
+        add_current_date: append the current date to the file name
+
+    Returns:
+        the path written
+
+    Raises:
+        NotImplementedError: if ``file_type`` is not one of the four supported formats
+    """
+    if add_current_date:
+        file_name = join_file_name_parts([file_name, pd.Timestamp.now().strftime(DATE_FORMAT)])
+    file_path = get_local_file_path(file_name=file_name,
+                                    file_type=file_type,
+                                    local_path=local_path)
+    if file_type == FileTypes.PNG:
+        fig.savefig(file_path, dpi=dpi)
+    elif file_type == FileTypes.EPS:
+        fig.savefig(file_path, dpi=dpi, format='eps')
+    elif file_type == FileTypes.SVG:
+        fig.savefig(file_path, dpi=dpi, format='svg')
+    elif file_type == FileTypes.PDF:
+        fig.savefig(file_path, dpi=dpi, format='pdf')
+    else:
+        raise NotImplementedError(f"{file_type}")
+    return file_path
+
+
+def save_figs(figs: Dict[str, plt.Figure],
+              file_name: str = '',
+              local_path: Optional[str] = None,
+              dpi: int = 300,
+              file_type=FileTypes.PNG,
+              add_current_date: bool = False,
+              **kwargs
+              ) -> None:
+    """
+    save matplotlib figures dict
+    """
+    for key, fig in figs.items():
+        file_path = save_fig(fig=fig,
+                             file_name=f"{file_name}_{key}",
+                             local_path=local_path,
+                             dpi=dpi,
+                             file_type=file_type,
+                             add_current_date=add_current_date,
+                             **kwargs)
+        print(file_path)
+
+
+def save_figs_to_pdf(figs: Union[List[plt.Figure], Dict[str, plt.Figure]],
+                     file_name: str,
+                     orientation: Literal['portrait', 'landscape'] = 'landscape',
+                     local_path: Optional[str] = None,
+                     add_current_date: bool = True
+                     ) -> str:
+    """
+    write several matplotlib figures to one multi-page PDF, one figure per page.
+
+    This is how a factsheet is assembled: each panel is drawn as its own figure and they are
+    collected here, so a report is a list of figures rather than a layout engine. A None entry is
+    skipped, which lets a caller build the list conditionally without filtering it.
+
+    Args:
+        figs: figures to write, in page order. A dict is written in insertion order and its keys
+            are ignored
+        file_name: base file name without extension
+        orientation: page orientation
+        local_path: directory to write to. None writes to the working directory
+        add_current_date: append the current date to the file name. True by default here, since a
+            report is usually dated
+
+    Returns:
+        the path written
+    """
+    if add_current_date:
+        file_name = join_file_name_parts([file_name, pd.Timestamp.now().strftime(DATE_FORMAT)])
+
+    file_path = get_local_file_path(file_name=file_name, file_type=FileTypes.PDF, local_path=local_path)
+
+    with PdfPages(file_path) as pdf:
+        if isinstance(figs, Dict):
+            for _, fig in figs.items():
+                if fig is not None:
+                    pdf.savefig(fig, orientation=orientation)
+        else:
+            for fig in figs:
+                if fig is not None:
+                    pdf.savefig(fig, orientation=orientation)
+    print(f"""<a href=r"{file_path}">link</a>""")
+    print(f"created PDF doc: {file_path}")
+    return file_path
