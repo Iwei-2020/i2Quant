@@ -1,0 +1,652 @@
+"""
+resampling with replacement: iid, stationary and fixed-block bootstraps, in numba.
+
+The module is organised around one separation. ``generate_bootstrapped_indices`` draws integer
+indices and touches no data; the ``bootstrap_*`` functions map those indices onto data. Drawing
+once and applying the same index array to several aligned panels is how a *paired* resample
+keeps the joint structure across panels, and it is why the index primitive is public.
+
+``BootstrapType`` selects the scheme. IID draws single observations and destroys
+autocorrelation. STATIONARY is Politis-Romano (1994): blocks start uniformly and run for a
+geometric number of periods with mean ``block_size``, so short-range dependence survives.
+FIXED_BLOCK uses blocks of exactly ``block_size``, for a length matched to a known cycle rather
+than drawn. ``min_block_size`` floors the drawn length, which matters when the panel mixes
+reporting frequencies.
+
+Blocks wrap circularly, ``(start + k) mod n``. Without the wrap a block drawn near the end of
+the sample is cut short, the realised block length is no longer geometric there, and the last
+observations can only ever appear in short blocks. STATIONARY gained the wrap in 5.1.0, so any
+result resampled under an earlier version does not reproduce.
+
+Draws are reproducible through ``seed``, which sets both the numpy and the numba random state -
+setting ``np.random.seed`` alone does not reach the ``@njit`` kernels.
+
+Entry points: ``generate_bootstrapped_indices`` for indices, ``bootstrap_data`` for a series or
+panel, ``bootstrap_price_data`` which resamples returns and recompounds them into prices rather
+than resampling price levels, ``bootstrap_ar_process`` for a fitted AR(1) with resampled
+residuals, and ``bootstrap_price_fundamental_data`` for prices carrying aligned fundamentals.
+``BootstrapOutput`` sets whether a draw set comes back as a DataFrame of columns or a list of
+arrays. Confidence intervals and the statistics computed on the draws are the caller's; this
+module only resamples.
+"""
+
+import numpy as np
+import pandas as pd
+from enum import Enum
+from numba import njit
+from numba.typed import List
+from typing import Union, Tuple, Dict, cast
+# qis
+import qis.utils.np_ops as npo
+import qis.perfstats.returns as ret
+
+FloatArray = np.ndarray[tuple[int, ...], np.dtype[np.float64]]
+
+
+class BootstrapType(Enum):
+    """
+    how observations are resampled.
+
+    Attributes:
+        IID: independent draws with replacement; destroys autocorrelation, so use it only when
+            the series is genuinely serially independent
+        STATIONARY: Politis-Romano circular blocks of geometric length, mean ``block_size``.
+            The default for financial returns, since it preserves short-range dependence
+        FIXED_BLOCK: circular blocks of exactly ``block_size``. Use when the block length is
+            chosen to match a known cycle rather than drawn
+    """
+    IID = 1
+    STATIONARY = 2
+    FIXED_BLOCK = 3
+
+
+class BootstrapOutput(Enum):
+    """
+    the shape a bootstrap function returns, which follows from the shape of its input.
+
+    Attributes:
+        SERIES_TO_DF: one input series becomes a DataFrame whose columns are the draws. Use for
+            a single series, where the samples are directly comparable side by side
+        DF_TO_LIST_ARRAYS: an input panel becomes a numba list of arrays, one per draw, each the
+            shape of the input. Use for a multi-asset panel, where a draw is itself a panel and
+            the cross-section must stay aligned within it
+    """
+    SERIES_TO_DF = 1
+    DF_TO_LIST_ARRAYS = 2
+
+
+@njit
+def set_seed(value):
+    """
+    set seed for numba space
+    """
+    np.random.seed(value)
+
+
+@njit
+def bootstrap_indices_iid(num_data_index: int,
+                          num_samples: int = 10,
+                          index_length: int = 1000,
+                          seed: int = 1
+                          ) -> np.ndarray:
+    """
+    generate IID bootstrap indices for every requested output position.
+
+    Args:
+        num_data_index: number of observations in the source data
+        num_samples: number of independent bootstrap draws
+        index_length: number of positions in each draw
+        seed: seed for the numba random state
+
+    Returns:
+        integer indices of shape ``(index_length, num_samples)``
+    """
+    np.random.seed(seed)
+    set_seed(seed)
+    bootstrapped_indices = np.zeros((index_length, num_samples), dtype=np.int64)
+    for idx in np.arange(num_samples):
+        previous_index, next_index = 0, 0
+        while next_index < index_length:
+            ran_indices = np.random.randint(low=0, high=num_data_index, size=num_data_index)
+            # Truncate only the final random batch, while still filling the complete output.
+            next_index = np.minimum(previous_index+num_data_index, index_length)
+            required_fill = next_index - previous_index
+            bootstrapped_indices[previous_index:next_index, idx] = ran_indices[:required_fill]
+            previous_index = next_index
+    return bootstrapped_indices
+
+
+@njit
+def bootstrap_indices_stationary(num_data_index: int,
+                                 num_samples: int = 10,
+                                 num_bootstrap_index: int = 1000,
+                                 block_size: int = 30,
+                                 min_block_size: int = 1,
+                                 seed: int = 1
+                                 ) -> np.ndarray:
+    """
+    generate stationary bootstrap indices, Politis-Romano (1994)
+
+    Blocks start at a uniformly drawn observation and run for a geometric number of periods
+    with mean ``block_size``, wrapping around the end of the sample. The wrap is what makes the
+    resample stationary: without it a block drawn near the end is cut short, the realised block
+    length is no longer geometric there, and the last observations can only ever appear in short
+    blocks.
+
+    ``min_block_size`` floors the block length, which matters when the panel mixes reporting
+    frequencies — a quarterly series needs at least three monthly periods to carry its own
+    autocorrelation into the resample.
+    """
+    np.random.seed(seed)
+    set_seed(seed)
+    bootstrapped_indices = np.zeros((num_bootstrap_index, num_samples), dtype=np.int64)
+    for idx in np.arange(num_samples):
+        next_index = 0
+        while next_index < num_bootstrap_index:
+            start_index = np.random.randint(low=0, high=num_data_index)  # random start of a block
+            # geometric length, mean block_size
+            random_block_size = np.random.geometric(1.0/block_size)
+            if random_block_size < min_block_size:
+                random_block_size = min_block_size
+            # never overrun the output
+            fill = np.minimum(random_block_size, num_bootstrap_index-next_index)
+            for k in range(fill):
+                # the modulo is the circular wrap: a block runs past the end into the start
+                bootstrapped_indices[next_index+k, idx] = (start_index+k) % num_data_index
+            next_index = next_index + fill
+    return bootstrapped_indices
+
+
+@njit
+def bootstrap_indices_fixed_block(num_data_index: int,
+                                  num_samples: int = 10,
+                                  num_bootstrap_index: int = 1000,
+                                  block_size: int = 30,
+                                  seed: int = 1
+                                  ) -> np.ndarray:
+    """
+    generate circular block bootstrap indices with a fixed block length
+
+    Every block is exactly ``block_size`` periods, wrapping at the end of the sample. Use this
+    when the block length is chosen to match a known cycle — a calendar year of quarterly
+    observations, say — rather than drawn.
+    """
+    np.random.seed(seed)
+    set_seed(seed)
+    bootstrapped_indices = np.zeros((num_bootstrap_index, num_samples), dtype=np.int64)
+    for idx in np.arange(num_samples):
+        next_index = 0
+        while next_index < num_bootstrap_index:
+            start_index = np.random.randint(low=0, high=num_data_index)
+            fill = np.minimum(block_size, num_bootstrap_index-next_index)
+            for k in range(fill):
+                bootstrapped_indices[next_index+k, idx] = (start_index+k) % num_data_index
+            next_index = next_index + fill
+    return bootstrapped_indices
+
+
+@njit
+def get_bootstrap_data_list(data_np: np.ndarray,
+                            bootstrapped_indices: np.ndarray
+                            ) -> List:
+    """
+    map indices to data
+    """
+    bootstrap_sample = List()
+    for index in np.transpose(bootstrapped_indices):
+        bootstrapped_data = data_np[index, :]
+        bootstrap_sample.append(bootstrapped_data)
+    return bootstrap_sample
+
+
+@njit
+def get_bootstrap_ar_data_list(residuals: np.ndarray,
+                               intercept: np.ndarray,
+                               beta: np.ndarray,
+                               data0: np.ndarray,
+                               bootstrapped_indices: np.ndarray,
+                               is_positive: bool = True
+                               ) -> List:
+    """
+    map indices to ar data
+    """
+    bootstrap_sample = List()
+    for index in np.transpose(bootstrapped_indices):
+        bootstrapped_resids = residuals[index, :]
+        bootstrapped_data = np.zeros_like(bootstrapped_resids)
+        y0 = data0*np.ones_like(beta)  # nb important for numba so it can map beta*y0
+        for idx, resid in enumerate(bootstrapped_resids):
+            y0 = intercept + beta*y0 + resid
+            if is_positive:
+                y0 = np.where(np.greater(y0, 0.0), y0, np.nanquantile(y0, 0.25))
+            bootstrapped_data[idx] = y0
+
+        bootstrap_sample.append(bootstrapped_data)
+    return bootstrap_sample
+
+
+def compute_ar_residuals(data: Union[pd.Series, pd.DataFrame]
+                         ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    fit an AR(1) per column and return the residuals on complete lag pairs.
+
+    A lag pair at t is usable when every column is observed at both t and t-1. Estimating and
+    residualising on that same set is what keeps the returned arrays aligned, and what stops a
+    gap being read as a one-period step. Rows must be complete across all columns because
+    ``bootstrap_ar_process`` resamples rows jointly to preserve the cross-section.
+
+    The coefficient is the conditional maximum likelihood estimate, which for an AR(1) is
+    ordinary least squares of the series on its own lag.
+
+    Args:
+        data: observations, one column per series
+
+    Returns:
+        Tuple of (residuals, intercept, beta). ``residuals`` has one row per usable lag pair and
+        one column per series, and contains no NaN. ``intercept`` and ``beta`` have one entry
+        per series
+
+    Raises:
+        ValueError: if no column is present, or if fewer than three usable lag pairs survive,
+            below which an AR(1) is not identified
+    """
+    if isinstance(data, pd.Series):
+        data = data.to_frame()
+    if data.shape[1] == 0:
+        raise ValueError(f"data has no columns, got {data.shape}")
+
+    values = data.to_numpy(dtype=float)
+    observed = np.isfinite(values).all(axis=1)
+    # both ends of the step must be observed, so a gap removes the pair rather than joining the
+    # observations either side of it
+    usable = observed[1:] & observed[:-1]
+    num_pairs = int(usable.sum())
+    if num_pairs < 3:
+        raise ValueError(f"need at least 3 complete lag pairs to identify an AR(1), "
+                         f"got {num_pairs} from {len(data.index)} rows")
+
+    y, y_1 = values[1:][usable], values[:-1][usable]
+    num_columns = values.shape[1]
+    intercept, beta = np.zeros(num_columns), np.zeros(num_columns)
+    residuals = np.zeros((num_pairs, num_columns))
+    for idx in range(num_columns):
+        target, regressor = y[:, idx], y_1[:, idx]
+        variance = float(np.var(regressor, ddof=1))
+        if np.isclose(variance, 0.0):
+            # a constant series has no autoregression to estimate: zero beta and a mean
+            # intercept reproduce it exactly
+            beta[idx] = 0.0
+            intercept[idx] = float(np.mean(target))
+        else:
+            beta[idx] = float(np.cov(target, regressor, ddof=1)[0, 1] / variance)
+            intercept[idx] = float(np.mean(target) - beta[idx] * np.mean(regressor))
+        residuals[:, idx] = target - (intercept[idx] + beta[idx] * regressor)
+    return residuals, intercept, beta
+
+
+def generate_bootstrapped_indices(num_data_index: int,
+                                  bootstrap_type: BootstrapType = BootstrapType.IID,
+                                  num_samples: int = 10,
+                                  index_length: int = 1000,
+                                  block_size: int = 30,
+                                  min_block_size: int = 1,
+                                  seed: int = 1
+                                  ) -> np.ndarray:
+    """
+    draw resampling indices, without touching any data.
+
+    This is the primitive behind every ``bootstrap_*`` function, and it is public because the
+    indices are what makes *paired* resampling possible: draw once, then apply the same index
+    array to several aligned panels so their joint structure survives the resample. Pass the
+    result as ``bootstrapped_indices`` to :func:`bootstrap_data` and friends.
+
+    Args:
+        num_data_index: number of observations in the source data
+        bootstrap_type: resampling scheme; see :class:`BootstrapType`
+        num_samples: number of independent bootstrap draws, the columns of the result
+        index_length: length of each draw, the rows of the result. May differ from
+            ``num_data_index``
+        block_size: mean block length for STATIONARY, exact block length for FIXED_BLOCK,
+            ignored for IID
+        min_block_size: floor on the drawn block length under STATIONARY. Set it to the number
+            of periods in the slowest-reporting series when the panel mixes frequencies
+        seed: seed for the numba random state
+
+    Returns:
+        integer indices, shape ``(index_length, num_samples)``, with every requested position
+        populated from ``[0, num_data_index)``; dependence between positions follows
+        ``bootstrap_type``
+
+    Raises:
+        ValueError: if ``bootstrap_type`` is not one of the implemented schemes
+    """
+    if bootstrap_type == BootstrapType.IID:
+        bootstrapped_indices = bootstrap_indices_iid(num_data_index=num_data_index,
+                                                     num_samples=num_samples,
+                                                     index_length=index_length,
+                                                     seed=seed)
+    elif bootstrap_type == BootstrapType.STATIONARY:
+        bootstrapped_indices = bootstrap_indices_stationary(num_data_index=num_data_index,
+                                                            num_samples=num_samples,
+                                                            num_bootstrap_index=index_length,
+                                                            block_size=block_size,
+                                                            min_block_size=min_block_size,
+                                                            seed=seed)
+    elif bootstrap_type == BootstrapType.FIXED_BLOCK:
+        bootstrapped_indices = bootstrap_indices_fixed_block(num_data_index=num_data_index,
+                                                             num_samples=num_samples,
+                                                             num_bootstrap_index=index_length,
+                                                             block_size=block_size,
+                                                             seed=seed)
+    else:
+        raise ValueError(f"bootstrap_type not implemented, got {bootstrap_type!r}")
+
+    return bootstrapped_indices
+
+
+def bootstrap_data(data: Union[pd.Series, pd.DataFrame],
+                   bootstrap_type: BootstrapType = BootstrapType.STATIONARY,
+                   bootstrap_output: BootstrapOutput = BootstrapOutput.DF_TO_LIST_ARRAYS,
+                   num_samples: int = 10,
+                   index_length: int = 1000,
+                   block_size: int = 30,
+                   min_block_size: int = 1,
+                   seed: int = 1,
+                   bootstrapped_indices: np.ndarray = None
+                   ) -> Union[List, pd.DataFrame]:
+    """
+    resample a series or panel with replacement, preserving the cross-section within each draw.
+
+    The whole row is resampled, not each column independently, so the contemporaneous correlation
+    structure survives. To resample two aligned panels jointly - factor returns and residuals, say -
+    draw the indices once with :func:`generate_bootstrapped_indices` and pass them here as
+    ``bootstrapped_indices`` for each panel.
+
+    Args:
+        data: observations to resample, rows are dates
+        bootstrap_type: resampling scheme; see :class:`BootstrapType`
+        bootstrap_output: shape of the result; see :class:`BootstrapOutput`
+        num_samples: number of independent draws
+        index_length: length of each draw, which need not equal the length of ``data``
+        block_size: mean block length for STATIONARY, exact length for FIXED_BLOCK
+        min_block_size: floor on the drawn block length under STATIONARY
+        seed: seed for the numba random state
+        bootstrapped_indices: precomputed indices. Given, every sampling argument above is ignored
+            and this is the array used, which is how paired resampling is done
+
+    Returns:
+        a DataFrame of draws for SERIES_TO_DF, or a list of arrays for DF_TO_LIST_ARRAYS
+    """
+    if bootstrapped_indices is None:
+        bootstrapped_indices = generate_bootstrapped_indices(num_data_index=len(data.index),
+                                                             bootstrap_type=bootstrap_type,
+                                                             num_samples=num_samples,
+                                                             index_length=index_length,
+                                                             block_size=block_size,
+                                                             min_block_size=min_block_size,
+                                                             seed=seed)
+
+    if bootstrap_output == BootstrapOutput.DF_TO_LIST_ARRAYS:
+        bootstrap_sample = get_bootstrap_data_list(data_np=data.to_numpy(),
+                                                   bootstrapped_indices=bootstrapped_indices)
+
+    elif bootstrap_output == BootstrapOutput.SERIES_TO_DF:
+        if not isinstance(data, pd.Series):
+            raise ValueError(f"data must be series")
+
+        bootstrap_sample = get_bootstrap_data_list(data_np=npo.np_array_to_matrix(a=data.to_numpy(), ncols=1),
+                                                   bootstrapped_indices=bootstrapped_indices)
+        data = []
+        for idx, sample in enumerate(bootstrap_sample):
+            data.append(pd.DataFrame(sample, columns=[f"path_{idx+1}"]))
+        bootstrap_sample = pd.concat(data, axis=1, sort=False)
+
+    else:
+        raise ValueError(f"not implemented")
+
+    return bootstrap_sample
+
+
+def bootstrap_ar_process(data: Union[pd.Series, pd.DataFrame],
+                         bootstrap_type: BootstrapType = BootstrapType.STATIONARY,
+                         bootstrap_output: BootstrapOutput = BootstrapOutput.DF_TO_LIST_ARRAYS,
+                         num_samples: int = 10,
+                         index_length: int = 1000,
+                         block_size: int = 30,
+                         min_block_size: int = 1,
+                         seed: int = 1,
+                         bootstrapped_indices: np.ndarray = None
+                         ) -> Union[List, pd.DataFrame]:
+
+    residuals, intercept, beta = compute_ar_residuals(data=data)
+    if bootstrapped_indices is None:
+        # an AR(1) on n observations has n-1 residuals, and the consumer is @njit with bounds
+        # checking off, so drawing over len(data.index) reads one row past the end
+        bootstrapped_indices = generate_bootstrapped_indices(num_data_index=len(residuals),
+                                                             bootstrap_type=bootstrap_type,
+                                                             num_samples=num_samples,
+                                                             index_length=index_length,
+                                                             block_size=block_size,
+                                                             min_block_size=min_block_size,
+                                                             seed=seed)
+    else:
+        # supplied indices were drawn over some other array. get_bootstrap_ar_data_list is
+        # njit with bounds checking off, so an index past the end reads adjacent memory
+        # and returns a plausible number instead of raising
+        largest = int(np.max(bootstrapped_indices))
+        if largest >= len(residuals):
+            raise ValueError(f"bootstrapped_indices reach {largest} but residuals has "
+                             f"{len(residuals)} rows: draw them over the residual rows, "
+                             f"which gaps in the data can shorten below len(data.index)-1")
+
+    if bootstrap_output == BootstrapOutput.DF_TO_LIST_ARRAYS:
+        bootstrap_sample = get_bootstrap_ar_data_list(residuals=residuals,
+                                                      intercept=intercept,
+                                                      beta=beta,
+                                                      data0=np.nanmean(data, axis=0),
+                                                      bootstrapped_indices=bootstrapped_indices)
+
+    elif bootstrap_output == BootstrapOutput.SERIES_TO_DF:
+        if not isinstance(data, pd.Series):
+            raise ValueError(f"data must be series")
+
+        bootstrap_sample = get_bootstrap_ar_data_list(residuals=residuals,
+                                                      intercept=intercept,
+                                                      beta=beta,
+                                                      data0=np.array(np.nanmean(data)),
+                                                      bootstrapped_indices=bootstrapped_indices)
+
+        data = []
+        for idx, sample in enumerate(bootstrap_sample):
+            data.append(pd.DataFrame(sample, columns=[f"path_{idx+1}"]))
+        bootstrap_sample = pd.concat(data, axis=1, sort=False)
+
+    else:
+        raise ValueError(f"not implemented")
+
+    return bootstrap_sample
+
+
+def _get_price_anchor(prices: Union[pd.Series, pd.DataFrame], init_to_end: bool) -> FloatArray:
+    """Return one reconstruction anchor per input series.
+
+    Args:
+        prices: Price levels, with one input series per DataFrame column.
+        init_to_end: Whether to continue from each series' last valid price. False preserves the
+            established physical-first-row alternative-history anchor.
+
+    Returns:
+        One-dimensional float array of anchors in input column order.
+    """
+    price_frame = prices.to_frame() if isinstance(prices, pd.Series) else prices
+    price_values = cast(FloatArray, price_frame.to_numpy(dtype=np.float64, na_value=np.nan))
+    if not init_to_end:
+        return price_values[0, :]
+
+    terminal_values = price_values[-1, :]
+    if np.all(np.isfinite(terminal_values) & (terminal_values > 0.0)):
+        return terminal_values
+
+    # Continuation anchors share the positive-finite domain of relative and log returns.
+    valid_prices = np.isfinite(price_values) & (price_values > 0.0)
+    row_positions = np.arange(price_values.shape[0])[:, np.newaxis]
+    last_positions = np.where(valid_prices, row_positions, -1).max(axis=0)
+    anchors = np.full(price_values.shape[1], np.nan, dtype=np.float64)
+    has_anchor = last_positions >= 0
+    # Select by position so duplicate column labels remain independent series.
+    column_positions = np.flatnonzero(has_anchor)
+    anchors[has_anchor] = price_values[last_positions[has_anchor], column_positions]
+    return anchors
+
+
+def bootstrap_price_data(prices: Union[pd.Series, pd.DataFrame],
+                         bootstrap_type: BootstrapType = BootstrapType.STATIONARY,
+                         bootstrap_output: BootstrapOutput = BootstrapOutput.DF_TO_LIST_ARRAYS,
+                         num_samples: int = 10,
+                         index_length: int = 1000,
+                         block_size: int = 20,
+                         min_block_size: int = 1,
+                         is_log_returns: bool = False,
+                         seed: int = 1,
+                         bootstrapped_indices: np.ndarray = None,
+                         init_to_end: bool = True
+                         ) -> Union[List[np.ndarray], pd.DataFrame]:
+    """
+    resample price levels by resampling their returns and recompounding.
+
+    Prices are not resampled directly - a block of prices lifted from one part of the sample would
+    jump at the joins. Returns are resampled and then compounded back into a path, so each draw is a
+    continuous price series with the return distribution of the original.
+
+    Args:
+        prices: Price levels. A Series represents one asset; a DataFrame has one column per asset.
+        bootstrap_type: resampling scheme; see :class:`BootstrapType`
+        bootstrap_output: Shape of the result; see :class:`BootstrapOutput`. Series input supports
+            either output mode; ``DF_TO_LIST_ARRAYS`` returns one-column arrays for that case.
+        num_samples: number of independent draws
+        index_length: length of each draw
+        block_size: mean block length for STATIONARY, exact length for FIXED_BLOCK. 1 is IID
+        min_block_size: floor on the drawn block length under STATIONARY
+        is_log_returns: resample log returns rather than arithmetic ones
+        seed: seed for the numba random state
+        bootstrapped_indices: precomputed indices, which override the sampling arguments
+        init_to_end: Start each path from its input series' last positive finite price, so ragged
+            columns continue from their own terminal observation. False starts every path from the
+            physical first row, so the draws are alternative histories
+
+    Returns:
+        A DataFrame of paths for SERIES_TO_DF, or a list of arrays for DF_TO_LIST_ARRAYS.
+    """
+    returns = ret.to_returns(prices=prices, is_log_returns=is_log_returns, drop_first=True)
+
+    # The list-output Numba kernel always consumes a rows-by-assets matrix, including one asset.
+    bootstrap_input = returns.to_frame() if (
+        bootstrap_output == BootstrapOutput.DF_TO_LIST_ARRAYS and isinstance(returns, pd.Series)
+    ) else returns
+    bootstrap_returns = bootstrap_data(data=bootstrap_input,
+                                       bootstrap_type=bootstrap_type,
+                                       bootstrap_output=bootstrap_output,
+                                       num_samples=num_samples,
+                                       index_length=index_length,
+                                       block_size=block_size,
+                                       min_block_size=min_block_size,
+                                       seed=seed,
+                                       bootstrapped_indices=bootstrapped_indices)
+
+    if bootstrap_output == BootstrapOutput.DF_TO_LIST_ARRAYS:
+        init_value = _get_price_anchor(prices=prices, init_to_end=init_to_end)
+
+        bootstrap_sample = List()
+        for sampled_returns in bootstrap_returns:
+            assert isinstance(sampled_returns, np.ndarray)
+            sampled_returns_float: FloatArray = sampled_returns.astype(np.float64, copy=False)
+            # Unlike log_returns_to_nav(), this path supports NumPy arrays and pandas objects.
+            if is_log_returns:
+                bootstrap_sample.append(ret.returns_to_nav(returns=sampled_returns_float,
+                                                           init_value=init_value,
+                                                           is_log_returns=True))
+            else:
+                bootstrap_sample.append(ret.returns_to_nav(returns=sampled_returns_float,
+                                                           init_value=init_value))
+
+    elif bootstrap_output == BootstrapOutput.SERIES_TO_DF:
+        assert isinstance(prices, pd.Series)
+        price_anchor = _get_price_anchor(prices=prices, init_to_end=init_to_end)
+        init_value = np.repeat(price_anchor, num_samples)
+
+        if is_log_returns:
+            bootstrap_sample = ret.log_returns_to_nav(log_returns=bootstrap_returns, init_value=init_value)
+        else:
+            bootstrap_sample = ret.returns_to_nav(returns=bootstrap_returns, init_value=init_value)
+    else:
+        raise ValueError(f"not implemented")
+
+    return bootstrap_sample
+
+
+def bootstrap_price_fundamental_data(price_datas: Dict[str, Union[pd.Series, pd.DataFrame]],
+                                     fundamental_datas: Dict[str, Union[pd.Series, pd.DataFrame]],
+                                     bootstrap_type: BootstrapType = BootstrapType.STATIONARY,
+                                     bootstrap_output: BootstrapOutput = BootstrapOutput.DF_TO_LIST_ARRAYS,
+                                     num_samples: int = 10,
+                                     index_length: int = 1000,
+                                     block_size: int = 30,
+                                     min_block_size: int = 1,
+                                     is_log_returns: bool = False,
+                                     seed: int = 1,
+                                     is_price_weighted_fundamentals: bool = False  # multiply by price_datas[0] price bootstrap
+                                     ) -> Tuple[Dict[str, Union[pd.DataFrame, List]], Dict[str, Union[pd.DataFrame, List]]]:
+
+    """
+    price data in the first element must  be aligned with all fundamentals
+    """
+    prices = price_datas[list(price_datas.keys())[0]]
+    for key, fundamental_data in fundamental_datas.items():
+        assert all(prices.index == fundamental_data.index)
+        if isinstance(prices, pd.DataFrame) and isinstance(fundamental_data, pd.DataFrame):
+            assert all(prices.columns == fundamental_data.columns)
+        elif isinstance(prices, pd.Series) and isinstance(fundamental_data, pd.Series):
+            pass
+        else:
+            raise ValueError(f" data types not aligned")
+
+    # very important to reduce lenth for returns and ar-1 bootstrap
+    bootstrapped_indices = generate_bootstrapped_indices(num_data_index=len(prices.index)-1,
+                                                         bootstrap_type=bootstrap_type,
+                                                         num_samples=num_samples,
+                                                         index_length=index_length,
+                                                         block_size=block_size,
+                                                         min_block_size=min_block_size,
+                                                         seed=seed)
+
+    bootstrap_prices = {}
+    for key, prices in price_datas.items():
+        bootstrap_prices[key] = bootstrap_price_data(prices=prices,
+                                                     bootstrap_type=bootstrap_type,
+                                                     bootstrap_output=bootstrap_output,
+                                                     num_samples=num_samples,
+                                                     index_length=index_length,
+                                                     block_size=block_size,
+                                                     is_log_returns=is_log_returns,
+                                                     seed=seed,
+                                                     bootstrapped_indices=bootstrapped_indices)
+
+    bootstrap_fundamentals = {}
+    for key, fundamental_data in fundamental_datas.items():
+        fundamentals = bootstrap_ar_process(data=fundamental_data,
+                                            bootstrap_type=bootstrap_type,
+                                            bootstrap_output=bootstrap_output,
+                                            num_samples=num_samples,
+                                            index_length=index_length,
+                                            block_size=block_size,
+                                            seed=seed,
+                                            bootstrapped_indices=bootstrapped_indices)
+
+        if is_price_weighted_fundamentals:
+            prices = bootstrap_prices[list(bootstrap_prices.keys())[0]]
+            for idx, (price, fund) in enumerate(zip(prices, fundamentals)):
+                fundamentals[idx] = price*fund
+
+        bootstrap_fundamentals[key] = fundamentals
+
+    return bootstrap_prices, bootstrap_fundamentals
