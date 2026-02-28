@@ -1,0 +1,403 @@
+"""
+risk-adjusted returns: divide by an EWM volatility, then build signals on the result.
+
+The primitive is ``compute_ra_returns``:
+
+    w_t = vol_target / sigma_t,   ra_t = w_t r_t
+
+with sigma an EWM volatility at ``span`` or ``ewm_lambda``. Two conventions hold throughout.
+The weight is lagged by ``weight_lag``, 1 by default, so the scaling applied over [t, t+1] uses
+the volatility known at t and the construction carries no look-ahead. And ``vol_target=None``
+means a non-dimensional unit target rather than no scaling: the output is then in units of risk,
+comparable across assets and summable across a panel, but not a tradeable return stream. Pass an
+explicit target to size a position. The function returns the triple (ra_returns, weights,
+ewm_vol), since the weights and the vol are usually wanted alongside.
+
+``vol_floor_quantile`` floors sigma at a rolling quantile of itself, so a quiet sample does not
+produce an unbounded weight; ``is_log_returns_to_arithmetic`` converts back with expm1 before
+scaling, for the common case where the vol was estimated on log returns.
+
+``compute_ewm_long_short_filtered_ra_returns`` is the trend primitive built on top: normalise by
+vol, then take the difference of a fast and a slow EWM to isolate the medium-frequency
+component. Every span drives λ = 1 - 2/(span + 1) and must be at least 1; below that the
+recursion alternates sign instead of smoothing, which on the vol leg yields a negative variance
+and NaN, so the spans are validated rather than trusted.
+
+``map_signal_to_weight`` turns a signal into a weight through a CDF - ``SignalMapType`` selects
+normal, Laplace or exponential - with separate tail levels and slopes for the two sides.
+``compute_returns_transform`` dispatches over ``ReturnsTransform`` for the rolling and momentum
+variants.
+
+Turning weights into a portfolio is ``qis.backtest_model_portfolio``; the EWM estimators
+themselves are ``qis/models/linear/ewm.py``.
+"""
+# packages
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+from scipy.stats import laplace
+from typing import Union, Optional, Tuple
+from enum import Enum
+# qis
+from qis.utils.annualisation import get_annualization_factor
+import qis.utils.np_ops as npo
+import qis.models.linear.ewm as ewm
+
+
+def compute_ra_returns(returns: Union[pd.Series, pd.DataFrame],
+                       span: Union[float, np.ndarray] = None,
+                       ewm_lambda: Union[float, np.ndarray] = 0.94,
+                       vol_target: Optional[float] = None,  # if need to target vol
+                       mean_adj_type: ewm.MeanAdjType = ewm.MeanAdjType.NONE,
+                       init_value: Optional[Union[float, np.ndarray]] = None,
+                       vol_floor_quantile: Optional[float] = None,  # to floor the volatility = 0.16
+                       vol_floor_quantile_roll_period: int = 5 * 260,  # 5y for daily returns
+                       warmup_period: Optional[int] = None,
+                       is_log_returns_to_arithmetic: bool = False,  # typically log-return are passed to vol computations
+                       weight_lag: Optional[int] = 1
+                       ) -> Tuple[Union[pd.Series, pd.DataFrame], Union[pd.Series, pd.DataFrame], Union[pd.Series, pd.DataFrame]]:
+
+    if span is not None:
+        ewm_lambda = 1.0-2.0/(span+1.0)
+
+    if vol_target is None:  # non-dimensional 100% vol target
+        annualize = False
+        vol_target = 1.0
+    else:
+        annualize = False
+
+    ewm_vol = ewm.compute_ewm_vol(data=returns,
+                                  ewm_lambda=ewm_lambda,
+                                  mean_adj_type=mean_adj_type,
+                                  init_value=init_value,
+                                  vol_floor_quantile=vol_floor_quantile,
+                                  vol_floor_quantile_roll_period=vol_floor_quantile_roll_period,
+                                  warmup_period=warmup_period,
+                                  annualize=annualize)
+
+    weights = npo.to_finite_reciprocal(data=ewm_vol, fill_value=np.nan, is_gt_zero=True)
+    weights = weights.multiply(vol_target)
+    if weight_lag is not None:
+        weights = weights.shift(weight_lag)
+
+    if is_log_returns_to_arithmetic:  # convert returns back to arithmetic = exp(r)-1.0
+        returns = np.expm1(returns)
+
+    ra_returns = returns.multiply(weights)
+
+    # alignment in case
+    if isinstance(ra_returns, pd.DataFrame):
+        ra_returns = ra_returns[returns.columns]
+        weights = weights[returns.columns]
+        ewm_vol = ewm_vol[returns.columns]
+
+    return ra_returns, weights, ewm_vol
+
+
+def compute_ewm_long_short_filtered_ra_returns(returns: pd.DataFrame,
+                                               vol_span: Optional[Union[int, np.ndarray]] = 31,
+                                               long_span: Union[int, np.ndarray] = 63,
+                                               short_span: Optional[Union[int, np.ndarray]] = 5,
+                                               warmup_period: Optional[Union[int, np.ndarray]] = 21,
+                                               weight_lag: Optional[int] = 1,
+                                               mean_adj_type: ewm.MeanAdjType = ewm.MeanAdjType.NONE
+                                               ) -> pd.DataFrame:
+    """
+    vol-normalise returns, then band-pass them with a long/short EWM filter.
+
+    The trend-following signal primitive: dividing by EWM vol puts every asset on comparable risk,
+    and the difference of a short and a long EWM isolates the medium-frequency component that a
+    trend signal is built from. The result is in units of risk, so it can be summed across assets.
+
+    Every span drives a decay ``lambda = 1 - 2/(span + 1)`` and so must be at least 1: ``span = 1``
+    passes the data through unsmoothed, and below 1 the recursion alternates sign rather than
+    smoothing, which on the vol leg can produce a negative variance and hence NaN.
+
+    Args:
+        returns: returns panel, one column per asset
+        vol_span: EWM span of the volatility used to normalise. None skips the normalisation
+        long_span: EWM span of the slow leg
+        short_span: EWM span of the fast leg, strictly less than ``long_span``. None applies the
+            long leg alone
+        warmup_period: leading periods blanked, before which the EWM state is still converging
+        weight_lag: periods to lag the filter output, so a signal formed at t is applied at t+1 and
+            the construction is free of look-ahead
+        mean_adj_type: mean subtracted before the vol estimate; see :class:`MeanAdjType`
+
+    Returns:
+        the filtered risk-adjusted returns, in the shape of ``returns``
+
+    Raises:
+        ValueError: if any span is below 1, or if ``short_span`` is not strictly less than
+            ``long_span``
+    """
+    if vol_span is not None and np.any(np.asarray(vol_span, dtype=float) < 1.0):
+        raise ValueError(f"compute_ewm_long_short_filtered_ra_returns: vol_span must be >= 1 "
+                         f"(lambda = 1 - 2/(span+1) is negative below span 1); got vol_span={vol_span}")
+    ewm._validate_long_short_spans(long_span=long_span, short_span=short_span)
+
+    if vol_span is not None:
+        ra_returns, _, _ = compute_ra_returns(returns=returns,
+                                              span=vol_span,
+                                              vol_target=None,
+                                              mean_adj_type=mean_adj_type,
+                                              weight_lag=weight_lag)
+    else:
+        ra_returns = returns
+    filter = ewm.compute_ewm_long_short_filter(data=ra_returns,
+                                               long_span=long_span,
+                                               short_span=short_span,
+                                               warmup_period=warmup_period)
+    return filter
+
+
+class SignalMapType(Enum):
+    NormalCDF = 1
+    LaplaceCDF = 2
+    ExpCDF = 3
+
+
+def map_signal_to_weight(signals: pd.DataFrame,
+                         signal_map_type: SignalMapType = SignalMapType.NormalCDF,
+                         loc: Union[float, pd.DataFrame] = 0.0,
+                         scale: Union[float, np.ndarray] = 1.0,
+                         tail_level: Union[float, np.ndarray] = 1.0,
+                         slope_right: Union[float, np.ndarray] = 0.5,
+                         slope_left: Union[float, np.ndarray] = 0.5,
+                         tail_decay_right: Optional[Union[float, np.ndarray]] = None,
+                         tail_decay_left: Optional[Union[float, np.ndarray]] = None
+                         ) -> pd.DataFrame:
+    x = signals.to_numpy()
+    if isinstance(loc, pd.DataFrame):
+        loc = loc.to_numpy()
+    if isinstance(scale, np.ndarray) and scale.shape[0] != x.shape[1]:
+        raise ValueError(f"{scale.shape[0]} != {x.shape[1]}")
+    if isinstance(slope_right, np.ndarray) and slope_right.shape[0] != x.shape[1]:
+        raise ValueError(f"{slope_right.shape[0]} != {x.shape[1]}")
+    if isinstance(slope_left, np.ndarray) and slope_left.shape[0] != x.shape[1]:
+        raise ValueError(f"{slope_left.shape[0]} != {x.shape[1]}")
+    if isinstance(tail_level, np.ndarray) and tail_level.shape[0] != x.shape[1]:
+        raise ValueError(f"{tail_level.shape[0]} != {x.shape[1]}")
+
+    if signal_map_type == SignalMapType.NormalCDF:
+        weight = 2.0*norm.cdf(x=x, loc=loc, scale=scale) - 1.0
+
+    elif signal_map_type == SignalMapType.LaplaceCDF:
+        weight = 2.0*laplace.cdf(x=x, loc=loc, scale=scale) - 1.0
+
+    elif signal_map_type == SignalMapType.ExpCDF:
+        if np.any(np.less_equal(tail_level, slope_right)) or np.any(np.less_equal(tail_level, slope_left)):
+            raise ValueError("must be tail>slope_positive and tail > slope_negative")
+        scale_negative = 1.5625 * scale / np.log(tail_level / (tail_level - slope_left))
+        scale_positive = 1.5625 * scale / np.log(tail_level / (tail_level - slope_right))
+        s_negative = - tail_level * (1.0 - np.exp(-np.square(x - loc) / scale_negative))
+        s_positive = tail_level * (1.0 - np.exp(-np.square(x - loc) / scale_positive))
+        # NumPy 2.x: comparison with `where=` needs `out=` so masked positions are False,
+        # causing np.where to select s_positive (the safer default for non-finite x).
+        finite_mask = np.isfinite(x)
+        less_mask = np.less(x, loc, out=np.zeros_like(finite_mask, dtype=bool), where=finite_mask)
+        weight = np.where(less_mask, s_negative, s_positive)
+
+        if tail_decay_right is not None and tail_decay_left is not None:  # take min(loc,0.0) and max(loc, 0.0)
+            if isinstance(tail_decay_right, np.ndarray) and tail_decay_right.shape[0] != x.shape[1]:
+                raise ValueError(f"{tail_decay_right.shape[0]} != {x.shape[1]}")
+            if isinstance(tail_decay_left, np.ndarray) and tail_decay_left.shape[0] != x.shape[1]:
+                raise ValueError(f"{tail_decay_left.shape[0]} != {x.shape[1]}")
+
+            x_left_tail = x + tail_level - np.where(np.less(loc, 0.0), loc, 0.0)
+            f_left_tail = np.where(np.less(x_left_tail, 0.0), np.exp(x_left_tail / tail_decay_left), 1.0)
+
+            x_right_tail = x - tail_level - np.where(np.greater(loc, 0.0), loc, 0.0)
+            f_right_tail = np.where(np.greater(x_right_tail, 0.0), np.exp(-x_right_tail / tail_decay_right), 1.0)
+
+            tails = np.where(np.greater(x_right_tail, 0.0), f_right_tail, f_left_tail)
+            weight = weight * tails
+
+    else:
+        raise NotImplementedError(f"signal_map_type={signal_map_type}")
+    weight = pd.DataFrame(weight, index=signals.index, columns=signals.columns)
+    return weight
+
+
+def compute_rolling_ra_returns(returns: pd.DataFrame,
+                               span: int = 1,
+                               ewm_lambda_eod: float = 0.94,
+                               vol_target: Optional[float] = None,
+                               weight_shift: Optional[int] = 1,
+                               is_log_returns_to_arithmetic: bool = True  # typically log-return are passed to vol
+                               ) -> pd.DataFrame:
+    """
+    span = 1: daily ra returns
+    otherwise compute sum of returns and then their vols
+    interpretation: voltargeting for returns over span
+    ewm_lambda is vol over the span too
+    """
+    if span > 1:
+        rolling_returns = returns.rolling(span).sum()
+        ewm_lambda = 1.0 - 2.0 / (span + 1.0)
+    else:
+        ewm_lambda = ewm_lambda_eod
+        rolling_returns = returns
+
+    ra_returns, weights, _ = compute_ra_returns(returns=rolling_returns,
+                                                ewm_lambda=ewm_lambda,
+                                                vol_target=vol_target,
+                                                weight_lag=weight_shift,
+                                                is_log_returns_to_arithmetic=is_log_returns_to_arithmetic)
+    return ra_returns
+
+
+def compute_sum_rolling_ra_returns(returns: pd.DataFrame,
+                                   span: int = 1,
+                                   ewm_lambda: float = 0.94,
+                                   vol_target: Optional[float] = None,
+                                   weight_shift: Optional[int] = 1,
+                                   is_log_returns_to_arithmetic: bool = True,  # typically log-return are passed to vol
+                                   is_norm: bool = True
+                                   ) -> pd.DataFrame:
+    """
+    span = 1: daily ra returns
+    otherwise compute sum of daily ra-returns
+    interpretation: pnl of daily voltargeting returns over span
+    """
+    ra_returns, weights, _ = compute_ra_returns(returns=returns,
+                                                ewm_lambda=ewm_lambda,
+                                                vol_target=vol_target,
+                                                weight_lag=weight_shift,
+                                                is_log_returns_to_arithmetic=is_log_returns_to_arithmetic)
+
+    if span > 1:
+        sum_rolling_ra_returns = ra_returns.rolling(span).sum()
+
+        if is_norm:
+            sum_rolling_ra_returns = sum_rolling_ra_returns.divide(np.sqrt(span))
+    else:
+        sum_rolling_ra_returns = ra_returns
+
+    return sum_rolling_ra_returns
+
+
+def compute_sum_freq_ra_returns(returns: Union[pd.Series, pd.DataFrame],
+                                freq: str = 'B',
+                                span: int = None,
+                                ewm_lambda: float = 0.94,
+                                vol_target: Optional[float] = None,
+                                weight_shift: Optional[int] = 1,
+                                is_log_returns_to_arithmetic: bool = True,  # typically log-return are passed to vol
+                                is_norm: bool = True,
+                                warmup_period: Optional[int] = None
+                                ) -> Union[pd.Series, pd.DataFrame]:
+    """
+    span = 1: daily ra returns
+    otherwise compute freq sum of daily ra-returns
+    interpretation: pnl of daily voltargeting returns over non-overlap freq
+    """
+    ra_returns, _, _ = compute_ra_returns(returns=returns,
+                                          span=span,
+                                          ewm_lambda=ewm_lambda,
+                                          vol_target=vol_target,
+                                          weight_lag=weight_shift,
+                                          is_log_returns_to_arithmetic=is_log_returns_to_arithmetic,
+                                          warmup_period=warmup_period)
+
+    if freq not in ['B', 'D']:
+        sum_rolling_ra_returns = ra_returns.resample(freq).sum()
+
+        if is_norm:
+            n_daily = get_annualization_factor(freq=freq)
+            sum_rolling_ra_returns = sum_rolling_ra_returns.divide(np.sqrt(n_daily))
+    else:
+        sum_rolling_ra_returns = ra_returns
+
+    return sum_rolling_ra_returns
+
+
+def compute_ewm_ra_returns_momentum(returns: Union[pd.Series, pd.DataFrame],
+                                    momentum_span: int = 63,
+                                    momentum_lambda: Optional[Union[float, np.ndarray]] = None,
+                                    vol_span: Union[float, np.ndarray] = 31,
+                                    vol_lambda: Optional[Union[float, np.ndarray]] = None,
+                                    weight_shift: Optional[int] = 1
+                                    ) -> Union[pd.Series, pd.DataFrame]:
+    """
+    span = 1: daily ra returns
+    """
+    if momentum_lambda is None:
+        momentum_lambda = 1.0 - 2.0 / (momentum_span + 1.0)
+    if vol_lambda is None:
+        vol_lambda = 1.0 - 2.0 / (vol_span + 1.0)
+
+    ra_returns, _, _ = compute_ra_returns(returns=returns,
+                                          ewm_lambda=vol_lambda,
+                                          vol_target=None,
+                                          weight_lag=weight_shift)
+
+    ewm_signal = ewm.ewm_recursion(a=ra_returns.to_numpy(),
+                                   ewm_lambda=momentum_lambda,
+                                   init_value=0.0 if isinstance(returns, pd.Series) else np.zeros(len(returns.columns)),
+                                   is_unit_vol_scaling=True)
+
+    if isinstance(returns, pd.DataFrame):
+        ewm_ra_returns_momentum = pd.DataFrame(data=ewm_signal, index=returns.index, columns=returns.columns)
+    else:
+        ewm_ra_returns_momentum = pd.Series(data=ewm_signal, index=returns.index, name=returns.name)
+
+    return ewm_ra_returns_momentum
+
+
+def get_paired_rareturns_signals(returns: Union[pd.Series, pd.DataFrame],
+                                 signal: Union[pd.Series, pd.DataFrame],
+                                 freq: str = 'BQ',
+                                 span: int = 63,
+                                 is_nonoverlapping: bool = True,
+                                 ra_returns_ewm_vol_lambda: float = 0.94,
+                                 is_mean_adjust_returns: bool = False
+                                 ) -> Tuple[Union[pd.Series, pd.DataFrame], Union[pd.Series, pd.DataFrame]]:
+
+    if is_nonoverlapping:
+        sum_freq_ra_returns = compute_sum_freq_ra_returns(returns=returns,
+                                                              freq=freq,
+                                                              ewm_lambda=ra_returns_ewm_vol_lambda,
+                                                              is_norm=True)
+        ra_return = sum_freq_ra_returns
+        indicator = signal.resample(freq).last().shift(1)
+    else:
+        sum_rolling_ra_returns = compute_sum_rolling_ra_returns(returns=returns,
+                                                                    span=span,
+                                                                    ewm_lambda=ra_returns_ewm_vol_lambda,
+                                                                    is_norm=True)
+        ra_return = sum_rolling_ra_returns
+        indicator = signal.shift(1)
+
+    # into two column dataframe
+    if is_mean_adjust_returns:
+        ra_returns_mean = ra_return.expanding(min_periods=1, axis=0).mean()  # apply pandas expanding
+        ra_return = ra_return.subtract(ra_returns_mean)
+
+    return ra_return, indicator
+
+
+class ReturnsTransform(Enum):
+    ROLLING_RA_RETURNS = 1
+    EWMA_RETURNS_MOMENTUM = 2
+
+
+def compute_returns_transform(returns: pd.DataFrame,
+                              returns_transform: ReturnsTransform = ReturnsTransform.ROLLING_RA_RETURNS,
+                              momentum_span: int = 31,
+                              vol_span: int = 33,
+                              rolling_ra_returns_span: int = 31
+                              ) -> pd.DataFrame:
+
+    if returns_transform == ReturnsTransform.ROLLING_RA_RETURNS:
+        returns_transform = compute_rolling_ra_returns(returns=returns,
+                                                       span=rolling_ra_returns_span,
+                                                       weight_shift=1)
+    elif returns_transform == ReturnsTransform.EWMA_RETURNS_MOMENTUM:
+        returns_transform = compute_ewm_ra_returns_momentum(returns=returns,
+                                                             momentum_span=momentum_span,
+                                                             vol_span=vol_span,
+                                                             weight_shift=1)
+    else:
+        raise TypeError(f"returns_transform {returns_transform} of {type(returns_transform)} not implemented")
+    return returns_transform
