@@ -1,0 +1,1011 @@
+"""
+regime-conditional performance: partition time by what a benchmark did, then report per bucket.
+
+A classifier resamples prices to its own ``freq``, computes benchmark returns, and labels each
+period with a regime id; ``compute_regimes_pa_perf_table`` then reports every asset conditional
+on those labels. The regime is a property of the *benchmark*, so all assets in a panel share one
+partition and their conditional statistics are comparable.
+
+``BenchmarkReturnsQuantilesRegime`` is the default and the one the factsheets use. Bucketing is
+``pd.qcut`` on benchmark returns at q = [0.0, 0.16, 0.84, 1.0] - the one-sigma cut, since
+P(Z < -1) = 15.87% rounds to 16% and the central mass is 68% against the normal's 68.27% -
+giving Bear / Normal / Bull. That default is shared with ``compute_regime_sharpe_decomposition``
+so the two agree. ``BenchmarkReturnsPositiveNegativeRegime`` splits on sign;
+``BenchmarkVolsQuantilesRegime`` buckets on realised volatility instead of return. Quantile
+edges must be unique: a constant or back-padded zero-return block raises here rather than
+surfacing as a bare pandas "Bin edges must be unique".
+
+``RegimeData`` selects which statistic the table reports - average, p.a., or Sharpe. The Sharpe
+branch is the one that needs care, and ``PerfParams.sharpe_convention`` selects it:
+
+    sr_s = sqrt(af) p_s m_s / std,   sum over regimes s of sr_s = the full-sample Sharpe
+
+is exactly additive under ARITHMETIC and LOG. PA does not decompose additively without a
+c-adjustment, which the table path applies and ``compute_regime_sharpe_decomposition`` refuses -
+that function is the returns-level counterpart for callers holding periodic returns rather than
+prices, with ``af`` explicit and no resampling.
+
+Main entry points: the three classifiers, ``compute_regimes_pa_perf_table`` on each,
+``compute_bnb_regimes_pa_perf_table`` for the benchmark case in one call, and
+``compute_regime_sharpe_decomposition``. Drawing regime shading and the regime panels is
+``qis/plots/derived/regime_data.py``; this module returns tables and colours only.
+"""
+from __future__ import annotations
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from abc import ABC, abstractmethod
+from matplotlib._color_data import CSS4_COLORS as mcolors
+from matplotlib.colors import to_hex
+from numbers import Integral
+from typing import Union, Dict, List, Tuple, Any, cast
+from enum import Enum
+
+import qis.utils.df_cut as dfc
+import qis.perfstats.perf_stats as pt
+import qis.perfstats.returns as ret
+from qis.perfstats.config import ReturnTypes, RegimeData, PerfParams, PerfStat, SharpeConvention
+from qis.utils.annualisation import get_annualization_factor
+
+# ============================================================================
+# Core computation functions
+# ============================================================================
+
+def compute_mean_freq_regimes(sampled_returns_with_regime_id: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    """Compute mean returns and frequency for each regime.
+
+    Args:
+        sampled_returns_with_regime_id: DataFrame with asset returns and a benchmark-defined
+            regime column. Frequencies count classified dates and are shared across assets,
+            independently of missing asset returns.
+
+    Returns:
+        Tuple of (regime means DataFrame, normalized classified-date frequencies Series)
+    """
+    regime_groups = sampled_returns_with_regime_id.groupby([RegimeClassifier.REGIME_COLUMN], observed=False)
+    regime_means = regime_groups.mean()
+    # Regimes are benchmark-defined, so count dates rather than non-missing asset returns.
+    regime_dims = regime_groups.size()
+
+    norm_sum = np.sum(regime_dims)
+
+    if np.isclose(norm_sum, 0.0):
+        # Preserve the categorical regime index and Series type for an empty sample.
+        norm_q = regime_dims.astype(float)
+    else:
+        norm_q = regime_dims / norm_sum
+
+    return regime_means, norm_q
+
+
+def compute_regime_avg(sampled_returns_with_regime_id: pd.DataFrame,
+                       freq: str,
+                       is_report_pa_returns: bool = True,
+                       regime_ids: List[str] = None,
+                       **kwargs
+                       ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+    """Compute conditional means and annualized contributions by regime.
+
+    Args:
+        sampled_returns_with_regime_id: DataFrame with returns and regime classification
+        freq: Sampling frequency for annualization
+        is_report_pa_returns: If True, report as per annum returns
+        regime_ids: Optional ordered list of regime IDs
+
+    Returns:
+        Tuple of (regime means, regime PA contributions, regime frequencies)
+    """
+    regime_means, norm_q = compute_mean_freq_regimes(
+        sampled_returns_with_regime_id=sampled_returns_with_regime_id
+    )
+
+    af_mult = get_annualization_factor(freq=freq)
+
+    if is_report_pa_returns:
+        regime_pa = np.expm1(regime_means.multiply(af_mult * norm_q, axis=0))
+    else:
+        regime_pa = regime_means.multiply(af_mult * norm_q, axis=0)
+
+    # Transpose: index = assets, columns = regimes
+    regime_means = regime_means.T
+    regime_pa = regime_pa.T
+
+    # Arrange columns by specified regime order
+    if regime_ids is not None:
+        regime_means = regime_means[regime_ids]
+        regime_pa = regime_pa[regime_ids]
+    return regime_means, regime_pa, norm_q
+
+
+def compute_regimes_pa_perf_table_from_sampled_returns(
+        sampled_returns_with_regime_id: pd.DataFrame,
+        prices: pd.DataFrame,
+        benchmark: str,
+        perf_params: PerfParams,
+        freq: str,
+        is_use_benchmark_means: bool = False,
+        is_add_ra_perf_table: bool = True,
+        drop_benchmark: bool = False,
+        additive_pa_returns_to_pa_total: bool = True,
+        regime_ids: List[str] = None,
+        **kwargs) -> Tuple[pd.DataFrame, Dict[RegimeData, pd.DataFrame]]:
+    """Compute comprehensive regime-conditional performance table.
+
+    Args:
+        sampled_returns_with_regime_id: Returns with regime classification
+        prices: Asset price series
+        benchmark: Benchmark asset name
+        perf_params: Performance calculation parameters
+        freq: Sampling frequency
+        is_use_benchmark_means: Replace the benchmark's ordered P.a. regime values with its
+            conditional periodic means
+        is_add_ra_perf_table: Include risk-adjusted performance table
+        drop_benchmark: Exclude benchmark from final table
+        additive_pa_returns_to_pa_total: Adjust regime PA to sum to total
+        regime_ids: Ordered list of regime IDs
+
+    Returns:
+        Tuple of (performance table, regime data dictionary)
+    """
+    regime_avg, regime_pa, norm_q = compute_regime_avg(
+        sampled_returns_with_regime_id=sampled_returns_with_regime_id,
+        regime_ids=regime_ids,
+        freq=freq,
+        **kwargs
+    )
+
+    # Label columns consistently
+    given_columns = regime_avg.columns.to_list()
+    regime_avg = regime_avg[given_columns]
+    regime_avg.columns = [f"{x} {RegimeData.REGIME_AVG.value}" for x in given_columns]
+
+    regime_pa = regime_pa[given_columns]
+    regime_pa.columns = [f"{x} {RegimeData.REGIME_PA.value}" for x in given_columns]
+    regime_pa_columns = regime_pa.columns
+
+    # Compute risk-adjusted performance table
+    ra_perf_table = pt.compute_ra_perf_table_with_benchmark(
+        prices=prices,
+        benchmark=benchmark,
+        perf_params=perf_params
+    )
+
+    if additive_pa_returns_to_pa_total:
+        # Adjust regime PA to match total PA return
+        total_sum = regime_pa[regime_pa_columns].sum(axis=1)
+        total_to_match = ra_perf_table[PerfStat.PA_RETURN.to_str()]
+        total_pa_diff = total_to_match - total_sum
+
+        weighted_diff = pd.DataFrame(
+            np.tile(total_pa_diff, (len(norm_q.to_numpy()), 1)).T,
+            index=total_pa_diff.index,
+            columns=norm_q.index
+        )
+        regime_pa_diff = weighted_diff.multiply(norm_q, axis=1)
+        regime_pa1 = regime_pa[regime_pa_columns].add(regime_pa_diff.to_numpy(), axis=0)
+    else:
+        regime_pa1 = regime_pa
+
+    if is_use_benchmark_means and benchmark is not None:
+        # Average and P.a. columns share regime order but not display labels. Use one .loc
+        # operation for pandas CoW and assign the already ordered values positionally.
+        regime_pa1.loc[benchmark, regime_pa_columns] = regime_avg.loc[benchmark].to_numpy()
+
+    # Compute regime Sharpe ratios
+    sharpe_convention = perf_params.sharpe_convention if perf_params is not None \
+        and hasattr(perf_params, 'sharpe_convention') else SharpeConvention.PA
+    if sharpe_convention in (SharpeConvention.ARITHMETIC, SharpeConvention.LOG):
+        # additive regime Sharpe (sharpe_conventions.md sections 1 and 4): under ARITHMETIC,
+        # sr_s = sqrt(af) * p_s * m_s / std(r) on the sampled simple returns; under LOG the same
+        # construction on log(1+r). In both, sum_s sr_s equals the total Sharpe of the convention
+        # exactly by linearity of the mean, so the pa additivity patch above does not apply, and
+        # numerator and denominator are paired on the identical periodic return series.
+        af_mult = get_annualization_factor(freq=freq)
+        sampled_returns = sampled_returns_with_regime_id.drop(columns=[RegimeClassifier.REGIME_COLUMN])
+        if sharpe_convention == SharpeConvention.LOG:
+            # log-space decomposition (Sepp 2020): sr_s = sqrt(af) * p_s * mean(log(1+r) | s) / std(log(1+r)),
+            # exactly additive to the log Sharpe, l = log(1+r) computed from the sampled simple returns
+            log_returns_with_id = sampled_returns_with_regime_id.copy()
+            log_returns_with_id[sampled_returns.columns] = np.log1p(sampled_returns)
+            conditional_means, _ = compute_mean_freq_regimes(sampled_returns_with_regime_id=log_returns_with_id)
+            conditional_means = conditional_means.T[given_columns]
+            an_vol = np.sqrt(af_mult) * np.log1p(sampled_returns).std(ddof=1)
+        else:
+            # arithmetic decomposition: sr_s = sqrt(af) * p_s * m_s / std(r), exactly additive
+            conditional_means = regime_avg.copy()
+            conditional_means.columns = given_columns
+            an_vol = np.sqrt(af_mult) * sampled_returns.std(ddof=1)
+        # linear annualized regime contributions af * p_s * m_s from the conditional means
+        regime_contrib = conditional_means.multiply(af_mult * norm_q[given_columns].to_numpy(), axis=1)
+        regime_sharpe = regime_contrib.divide(an_vol, axis=0)
+        regime_sharpe.columns = [f"{x}{RegimeData.REGIME_SHARPE.value}" for x in given_columns]
+    else:  # SharpeConvention.PA, the default: unchanged
+        vols_for_sharpe_pa = ra_perf_table[PerfStat.VOL.to_str()]
+        regime_sharpe = regime_pa1.divide(vols_for_sharpe_pa, axis=0)[regime_pa_columns]
+        regime_sharpe.columns = [f"{x}{RegimeData.REGIME_SHARPE.value}" for x in given_columns]
+
+    # Combine into performance table
+    if is_add_ra_perf_table:
+        cond_perf_table = pd.concat([regime_avg, regime_pa1, regime_sharpe, ra_perf_table],
+                                    axis=1, sort=False)
+    else:
+        cond_perf_table = pd.concat([regime_avg, regime_pa1, regime_sharpe], axis=1, sort=False)
+
+    regime_datas = {
+        RegimeData.REGIME_AVG: regime_avg,
+        RegimeData.REGIME_PA: regime_pa1,
+        RegimeData.REGIME_SHARPE: regime_sharpe
+    }
+
+    if drop_benchmark:
+        cond_perf_table = cond_perf_table.drop(benchmark, axis=0)
+
+    return cond_perf_table, regime_datas
+
+
+# ============================================================================
+# Abstract base class
+# ============================================================================
+
+class RegimeClassifier(ABC):
+    """Abstract base class for regime classification.
+
+    Regime classifiers partition time periods based on market conditions
+    for conditional performance attribution analysis.
+    """
+
+    REGIME_COLUMN = 'regime'
+
+    def __init__(self):
+        self.regime_ids_colors: Dict[str, str] = {}
+        super().__init__()
+
+    @abstractmethod
+    def compute_sampled_returns_with_regime_id(self, **kwargs) -> pd.DataFrame:
+        """Compute returns with regime classification.
+
+        Returns:
+            DataFrame with returns and regime ID column
+        """
+        pass
+
+    def get_regime_ids_colors(self) -> Dict[str, str]:
+        """Get mapping of regime IDs to visualization colors.
+
+        Returns:
+            Dictionary mapping regime ID strings to color codes
+        """
+        return self.regime_ids_colors
+
+    def get_regime_ids(self) -> List[str]:
+        """Get ordered list of regime IDs.
+
+        Returns:
+            List of regime ID strings
+        """
+        return list(self.get_regime_ids_colors().keys())
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert regime parameters to dictionary.
+
+        Generic implementation that extracts public attributes (not starting with '_')
+        from the instance, excluding methods and the REGIME_COLUMN class variable.
+        Subclasses can override to customize serialization.
+
+        Returns:
+            Dictionary of parameter names to values
+
+        Examples:
+            >>> classifier = BenchmarkReturnsQuantilesRegime(freq='QE', q=4)
+            >>> classifier.to_dict()
+            {'freq': 'QE', 'return_type': <ReturnTypes.RELATIVE: ...>, 'q': 4, ...}
+        """
+        params = {}
+        for key, value in self.__dict__.items():
+            # Skip private attributes and methods
+            if not key.startswith('_') and not callable(value):
+                params[key] = value
+        return params
+
+    def compute_regimes_pa_perf_table(self,
+                                      regime_id_func_kwargs: Dict[str, Any],
+                                      prices: pd.DataFrame,
+                                      benchmark: str,
+                                      freq: str,
+                                      perf_params: PerfParams,
+                                      is_use_benchmark_means: bool = False,
+                                      is_add_ra_perf_table: bool = True,
+                                      drop_benchmark: bool = False,
+                                      additive_pa_returns_to_pa_total: bool = True,
+                                      regime_ids: List[str] = None,
+                                      **kwargs) -> Tuple[pd.DataFrame, Dict[RegimeData, pd.DataFrame]]:
+        """Compute regime-conditional performance attribution table.
+
+        Args:
+            regime_id_func_kwargs: Arguments for regime ID computation
+            prices: Asset price series
+            benchmark: Benchmark asset name
+            freq: Sampling frequency
+            perf_params: Performance parameters; perf_params.sharpe_convention selects the
+                regime-Sharpe convention (PA default, ARITHMETIC/LOG exactly additive)
+            is_use_benchmark_means: Replace the benchmark's ordered P.a. regime values with its
+                conditional periodic means
+            is_add_ra_perf_table: Include risk-adjusted performance
+            drop_benchmark: Exclude benchmark from results
+            additive_pa_returns_to_pa_total: Adjust regime PA to sum to total
+            regime_ids: Ordered list of regime IDs
+
+        Returns:
+            Tuple of (performance table, regime data dictionary)
+        """
+        sampled_returns_with_regime_id = self.compute_sampled_returns_with_regime_id(
+            **regime_id_func_kwargs
+        )
+
+        # Data-derived classifiers can expose their ordered IDs only after classification.
+        if regime_ids is None:
+            regime_ids = self.get_regime_ids()
+
+        cond_perf_table, regime_datas = compute_regimes_pa_perf_table_from_sampled_returns(
+            sampled_returns_with_regime_id=sampled_returns_with_regime_id,
+            prices=prices,
+            benchmark=benchmark,
+            perf_params=perf_params,
+            freq=freq,
+            is_use_benchmark_means=is_use_benchmark_means,
+            is_add_ra_perf_table=is_add_ra_perf_table,
+            drop_benchmark=drop_benchmark,
+            regime_ids=regime_ids
+        )
+
+        return cond_perf_table, regime_datas
+
+    def class_data_to_colors(self, regime_data: pd.Series) -> pd.Series:
+        """Map regime IDs to colors for visualization.
+
+        Args:
+            regime_data: Series of regime IDs
+
+        Returns:
+            Series of color codes
+        """
+        map_id_into_color = self.get_regime_ids_colors()
+        # pandas 3.0 + Categorical input:
+        #   - regime_data is typically Categorical (from pd.cut), so .map returns a Categorical
+        #     whose categories are only the mapped color codes — assigning '#FFFFFF' to NaN
+        #     positions raises "Cannot setitem on a Categorical with a new category".
+        #   - Under the new `str` dtype, .astype(str) also preserves real NaN instead of
+        #     coercing to the literal string 'nan', so the old .replace({'nan': ...}) no-ops.
+        # Fix: map, coerce to plain object, then fillna with the neutral color.
+        regime_id_color = regime_data.map(map_id_into_color)
+        # astype(object) drops any Categorical / str-ExtensionArray wrapping so fillna accepts
+        # an arbitrary string value.
+        regime_id_color = regime_id_color.astype(object).fillna('#FFFFFF').astype(str)
+        return regime_id_color
+
+
+# ============================================================================
+# Concrete implementations
+# ============================================================================
+
+class BenchmarkReturnsQuantilesRegime(RegimeClassifier):
+    """Regime classifier based on benchmark return quantiles.
+
+    Classifies periods into regimes based on quantiles of benchmark returns,
+    enabling analysis of performance in different market environments
+    (e.g., bear, normal, bull markets). Without an explicit mapping, three buckets
+    retain the semantic Bear/Normal/Bull IDs; other bucket counts receive ordered
+    Q1 through Qn IDs.
+    """
+
+    def __init__(self,
+                 freq: str = 'QE',
+                 return_type: ReturnTypes = ReturnTypes.RELATIVE,
+                 q: Union[np.ndarray, int] = None,
+                 regime_ids_colors: Dict[str, str] = None):
+        """Initialize benchmark returns quantiles regime classifier.
+
+        Args:
+            freq: Sampling frequency (default: 'QE' for quarter-end)
+            return_type: Type of returns to compute
+            q: Quantile boundaries or number of quantiles (default: [0.0, 0.16, 0.84, 1.0],
+                the one-sigma cut: P(Z < -1) = 15.87% rounds to 16%, central mass 68%
+                against the normal's 68.27%. Changed from [0.0, 0.17, 0.83, 1.0] in 5.0.7).
+                Three buckets use Bear/Normal/Bull by default; other counts use ordered Q1-Qn IDs.
+            regime_ids_colors: Optional ordered mapping of regime names to colors. Its length must
+                equal the number of quantile buckets.
+        """
+        super().__init__()
+        self.freq = freq
+        self.return_type = return_type
+        self.q = q if q is not None else np.array([0.0, 0.16, 0.84, 1.0])  # one-sigma default, see compute_regime_sharpe_decomposition
+        num_buckets = (int(cast(int, self.q)) if np.isscalar(self.q)
+                       else len(np.asarray(self.q)) - 1)
+
+        # Keep one ordered ID and color per bucket while preserving the semantic three-band case.
+        if regime_ids_colors is None:
+            if num_buckets == 3:
+                self.regime_ids_colors = {
+                    'Bear': str(mcolors['salmon']),
+                    'Normal': str(mcolors['yellowgreen']),
+                    'Bull': str(mcolors['darkgreen'])
+                }
+            else:
+                cmap = plt.get_cmap('RdYlGn', num_buckets)
+                self.regime_ids_colors = {
+                    f'Q{n + 1}': to_hex(cmap(n)) for n in range(num_buckets)
+                }
+        elif len(regime_ids_colors) != num_buckets:
+            raise ValueError(
+                f"{num_buckets} quantile buckets require {num_buckets} regime labels and colors; "
+                f"received {len(regime_ids_colors)}"
+            )
+        else:
+            self.regime_ids_colors = dict(regime_ids_colors)
+
+    def compute_sampled_returns_with_regime_id(self,
+                                               prices: Union[pd.DataFrame, pd.Series],
+                                               benchmark: str,
+                                               include_start_date: bool = True,
+                                               include_end_date: bool = True,
+                                               **kwargs) -> pd.DataFrame:
+        """Classify periods by benchmark return quantiles.
+
+        Args:
+            prices: Asset prices
+            benchmark: Benchmark column name
+            include_start_date: Include first period
+            include_end_date: Include last period
+
+        Returns:
+            DataFrame with returns and regime classification
+
+        Raises:
+            ValueError: If insufficient data for classification, or if the benchmark
+                returns are degenerate (constant / too many ties) so that quantile
+                bin edges are not unique.
+        """
+        if isinstance(prices, pd.Series):
+            prices = prices.to_frame()
+
+        sampled_returns_with_regime_id = ret.to_returns(
+            prices=prices,
+            freq=self.freq,
+            return_type=self.return_type,
+            include_start_date=include_start_date,
+            include_end_date=include_end_date
+        )
+
+        if len(sampled_returns_with_regime_id.index) < 3:
+            raise ValueError(
+                f"Need at least 3 returns in time series: {sampled_returns_with_regime_id.index}\n"
+                f"Decrease regime frequency"
+            )
+
+        x = sampled_returns_with_regime_id[benchmark]
+
+        # Guard against a degenerate regime benchmark: pd.qcut requires strictly
+        # increasing bin edges, but a constant / zero-return block (e.g. an overlay
+        # nav with longer history than the principal, back-padded over the union
+        # index) collapses interior quantiles onto the same value and raises a bare
+        # "Bin edges must be unique". The condition below mirrors qcut exactly
+        # (unique edges <= number of labels), so it fires iff qcut would have failed
+        # and never on healthy data. Surface the cause instead of the pandas trace.
+        labels = self.get_regime_ids()
+        x_valid = x.dropna().to_numpy(dtype=float)
+        probs = (np.linspace(0.0, 1.0, int(self.q) + 1) if np.isscalar(self.q)
+                 else np.asarray(self.q, dtype=float))
+        edges = np.nanquantile(x_valid, probs) if x_valid.size > 0 else np.array([])
+        if np.unique(edges).size <= len(labels):
+            raise ValueError(
+                f"Regime benchmark '{x.name}' is degenerate for q={self.q}: only "
+                f"{max(np.unique(edges).size - 1, 0)} of {len(labels)} quantile bands "
+                f"are non-empty (edges={np.unique(edges).tolist()}).\n"
+                f"This usually means a constant or zero-return block from misaligned "
+                f"navs — clip the inputs to their common live window before classifying."
+            )
+
+        quant0 = pd.qcut(x=x, q=self.q, labels=labels)
+        sampled_returns_with_regime_id[self.REGIME_COLUMN] = quant0
+
+        return sampled_returns_with_regime_id
+
+    def compute_regimes_pa_perf_table(self,
+                                      prices: pd.DataFrame,
+                                      benchmark: str,
+                                      perf_params: PerfParams,
+                                      drop_benchmark: bool = False,
+                                      **kwargs) -> Tuple[pd.DataFrame, Dict[RegimeData, pd.DataFrame]]:
+        """Compute regime performance attribution table.
+
+        Args:
+            prices: Asset prices
+            benchmark: Benchmark asset name
+            perf_params: Performance parameters; perf_params.sharpe_convention selects the
+                regime-Sharpe convention (PA default, ARITHMETIC/LOG exactly additive)
+            drop_benchmark: Exclude benchmark from results
+
+        Returns:
+            Tuple of (performance table, regime data dictionary)
+        """
+        regime_id_func_kwargs = dict(
+            prices=prices,
+            benchmark=benchmark,
+            include_start_date=True,
+            include_end_date=True
+        )
+
+        return super().compute_regimes_pa_perf_table(
+            regime_id_func_kwargs=regime_id_func_kwargs,
+            prices=prices,
+            benchmark=benchmark,
+            perf_params=perf_params,
+            freq=self.freq,
+            is_report_pa_returns=True,
+            is_use_benchmark_means=False,
+            regime_ids=self.get_regime_ids(),
+            drop_benchmark=drop_benchmark
+        )
+
+
+class BenchmarkReturnsPositiveNegativeRegime(RegimeClassifier):
+    """Regime classifier based on positive vs negative benchmark returns.
+
+    Classifies periods into two ordered regimes based on benchmark return sign,
+    useful for up/down market analysis. Both regime categories remain available for aggregation
+    when one is unobserved, while missing benchmark returns remain unclassified.
+    """
+
+    def __init__(self,
+                 freq: str = 'QE',
+                 return_type: ReturnTypes = ReturnTypes.RELATIVE,
+                 regime_ids_colors: Dict[str, str] = None):
+        """Initialize positive/negative regime classifier.
+
+        Args:
+            freq: Sampling frequency (default: 'QE' for quarter-end)
+            return_type: Type of returns to compute
+            regime_ids_colors: Optional ordered mapping of exactly two regime names to colors.
+                The first entry classifies negative returns and the second classifies zero or
+                positive returns.
+
+        Raises:
+            ValueError: If an explicit mapping does not contain exactly two entries.
+        """
+        super().__init__()
+        self.freq = freq
+        self.return_type = return_type
+        # Keep two ordered metadata entries aligned with the classifier's two sign states.
+        if regime_ids_colors is None:
+            self.regime_ids_colors = {
+                'Negative': mcolors['salmon'],
+                'Positive': mcolors['darkgreen']
+            }
+        elif len(regime_ids_colors) != 2:
+            raise ValueError(
+                'Positive/negative regimes require exactly 2 regime labels and colors; '
+                f'received {len(regime_ids_colors)}'
+            )
+        else:
+            self.regime_ids_colors = dict(regime_ids_colors)
+
+    def compute_sampled_returns_with_regime_id(self,
+                                               prices: Union[pd.DataFrame, pd.Series],
+                                               benchmark: str,
+                                               include_start_date: bool = True,
+                                               include_end_date: bool = True,
+                                               **kwargs) -> pd.DataFrame:
+        """Classify periods by benchmark return sign.
+
+        Args:
+            prices: Asset prices
+            benchmark: Benchmark column name
+            include_start_date: Include first period
+            include_end_date: Include last period
+
+        Returns:
+            DataFrame with returns and an ordered categorical regime classification containing
+            both configured IDs. Missing benchmark returns have a missing regime ID.
+
+        Raises:
+            ValueError: If insufficient data for classification
+        """
+        if isinstance(prices, pd.Series):
+            prices = prices.to_frame()
+
+        sampled_returns_with_regime_id = ret.to_returns(
+            prices=prices,
+            freq=self.freq,
+            return_type=self.return_type,
+            include_start_date=include_start_date,
+            include_end_date=include_end_date
+        )
+
+        if len(sampled_returns_with_regime_id.index) < 2:
+            raise ValueError(
+                f"Need at least 2 returns in time series: {sampled_returns_with_regime_id.index}\n"
+                f"Decrease regime frequency"
+            )
+
+        benchmark_returns = cast(pd.Series, sampled_returns_with_regime_id[benchmark])
+        regime_ids = self.get_regime_ids()
+
+        # A missing benchmark return has no sign and must not enter either frequency bucket.
+        observed = benchmark_returns.notna()
+        regime_classification = pd.Series(
+            np.nan,
+            index=benchmark_returns.index,
+            name=self.REGIME_COLUMN,
+            dtype=object,
+        )
+        regime_classification.loc[observed] = np.where(
+            benchmark_returns.loc[observed] < 0,
+            regime_ids[0],
+            regime_ids[1],
+        )
+        # Retain both ordered categories so aggregation preserves an unobserved sign regime.
+        regime_classification = pd.Series(
+            pd.Categorical(regime_classification, categories=regime_ids, ordered=True),
+            index=benchmark_returns.index,
+            name=self.REGIME_COLUMN,
+        )
+
+        sampled_returns_with_regime_id[self.REGIME_COLUMN] = regime_classification
+
+        return sampled_returns_with_regime_id
+
+    def compute_regimes_pa_perf_table(self,
+                                      prices: pd.DataFrame,
+                                      benchmark: str,
+                                      perf_params: PerfParams,
+                                      drop_benchmark: bool = False,
+                                      **kwargs) -> Tuple[pd.DataFrame, Dict[RegimeData, pd.DataFrame]]:
+        """Compute regime performance attribution table.
+
+        Args:
+            prices: Asset prices
+            benchmark: Benchmark asset name
+            perf_params: Performance parameters; perf_params.sharpe_convention selects the
+                regime-Sharpe convention (PA default, ARITHMETIC/LOG exactly additive)
+            drop_benchmark: Exclude benchmark from results
+
+        Returns:
+            Tuple of (performance table, regime data dictionary)
+        """
+        regime_id_func_kwargs = dict(
+            prices=prices,
+            benchmark=benchmark,
+            include_start_date=True,
+            include_end_date=True
+        )
+
+        return super().compute_regimes_pa_perf_table(
+            regime_id_func_kwargs=regime_id_func_kwargs,
+            prices=prices,
+            benchmark=benchmark,
+            perf_params=perf_params,
+            freq=self.freq,
+            is_report_pa_returns=True,
+            is_use_benchmark_means=False,
+            regime_ids=self.get_regime_ids(),
+            drop_benchmark=drop_benchmark
+        )
+
+
+class BenchmarkVolsQuantilesRegime(RegimeClassifier):
+    """Regime classifier based on benchmark volatility quantiles.
+
+    Classifies periods based on realized volatility levels, enabling analysis
+    of performance in different volatility environments. After classification,
+    the data-derived threshold IDs and their colors are available through the
+    inherited regime metadata interface.
+    """
+
+    def __init__(self,
+                 freq: str = 'QE',
+                 return_type: ReturnTypes = ReturnTypes.RELATIVE,
+                 q: int = 4):
+        """Initialize volatility quantiles regime classifier.
+
+        Args:
+            freq: Sampling frequency for volatility calculation
+            return_type: Type of returns to compute
+            q: Positive integer number of quantile buckets. NumPy integer scalars are accepted;
+                booleans are invalid.
+
+        Raises:
+            ValueError: If ``q`` is not a positive integer.
+        """
+        super().__init__()
+        # One positive integer must control both qcut allocation and published regime metadata.
+        if isinstance(q, (bool, np.bool_)) or not isinstance(q, Integral) or q <= 0:
+            raise ValueError(f"q must be a positive integer, got {q!r}")
+        self.freq = freq
+        self.return_type = return_type
+        self.q = int(q)
+        self.regime_colors: Dict[str, Tuple[float, ...]] = {}
+
+    def compute_sampled_returns_with_regime_id(self,
+                                               prices: pd.DataFrame,
+                                               benchmark: str,
+                                               include_start_date: bool = True,
+                                               include_end_date: bool = True,
+                                               **kwargs) -> pd.DataFrame:
+        """Classify periods by benchmark volatility quantiles.
+
+        Args:
+            prices: Asset prices
+            benchmark: Benchmark column name
+            include_start_date: Include first period
+            include_end_date: Include last period
+
+        Returns:
+            DataFrame with returns and regime classification. The ordered threshold IDs and one
+            color per ID are also available through ``get_regime_ids_colors()``.
+
+        Raises:
+            ValueError: If the benchmark has no finite volatility observations or fewer than
+                ``q`` volatility quantile bands contain observations.
+        """
+        vols = ret.compute_sampled_vols(
+            prices=prices[benchmark],
+            freq_vol=self.freq,
+            include_start_date=include_start_date,
+            include_end_date=include_end_date
+        )
+
+        finite_vol_mask = pd.Series(
+            np.isfinite(vols.to_numpy(dtype=float, na_value=np.nan)),
+            index=vols.index,
+        )
+        valid_vols = vols.loc[finite_vol_mask]
+        if valid_vols.empty:
+            # Reject an unusable benchmark before the quantile helper derives all-NaN bin edges.
+            raise ValueError(
+                f"Volatility regime benchmark '{benchmark}' has no finite volatility "
+                f"observations for q={self.q}."
+            )
+        if self.q > 0 and not valid_vols.empty:
+            # Require every requested band to contain data before publishing its ID and color.
+            quantile_classification, quantile_edges = cast(
+                Tuple[pd.Categorical, np.ndarray],
+                pd.qcut(
+                    x=valid_vols.to_numpy(dtype=float),
+                    q=self.q,
+                    duplicates='drop',
+                    retbins=True,
+                ),
+            )
+            occupied_codes = quantile_classification.codes[quantile_classification.codes >= 0]
+            num_nonempty_bands = int(np.unique(occupied_codes).size)
+            if num_nonempty_bands < self.q:
+                unique_edges = np.unique(np.asarray(quantile_edges, dtype=float)).tolist()
+                raise ValueError(
+                    f"Volatility regime benchmark '{benchmark}' is degenerate for q={self.q}: "
+                    f"only {num_nonempty_bands} of {self.q} quantile bands are non-empty "
+                    f"(edges={unique_edges}).\n"
+                    f"Use fewer buckets or a longer or more variable benchmark history."
+                )
+
+        hue_name = f"{benchmark} vol"
+        classificator, labels = dfc.add_quantile_classification(
+            df=vols.to_frame(),
+            x_column=benchmark,
+            num_buckets=self.q,
+            hue_name=hue_name,
+            xvar_format='{:.0%}',
+            bucket_prefix=hue_name
+        )
+
+        classificator = classificator.sort_index()
+
+        sampled_returns_with_regime_id = ret.to_returns(
+            prices=prices,
+            freq=self.freq,
+            return_type=self.return_type,
+            include_start_date=include_start_date,
+            include_end_date=include_end_date
+        )
+
+        # Pandas 2.x can stringify a missing categorical as ``"nan"``. Reapply the numerical
+        # validity mask so unavailable windows remain missing on every supported pandas version.
+        regime_ids = classificator[hue_name].where(finite_vol_mask, other=np.nan)
+        sampled_returns_with_regime_id[self.REGIME_COLUMN] = regime_ids
+
+        # Publish data-derived labels through the shared metadata contract while preserving the
+        # existing RGBA output returned by get_regime_colors().
+        cmap = plt.get_cmap('RdYlGn', len(labels))
+        colors = [cmap(n) for n in range(len(labels))]
+        self.regime_colors = {k: v for k, v in zip(labels, colors)}
+        self.regime_ids_colors = {k: to_hex(cmap(n)) for n, k in enumerate(labels)}
+
+        return sampled_returns_with_regime_id
+
+    def compute_regimes_pa_perf_table(self,
+                                      prices: pd.DataFrame,
+                                      benchmark: str,
+                                      perf_params: PerfParams,
+                                      drop_benchmark: bool = False,
+                                      **kwargs) -> Tuple[pd.DataFrame, Dict[RegimeData, pd.DataFrame]]:
+        """Compute regime performance attribution table.
+
+        Args:
+            prices: Asset prices
+            benchmark: Benchmark asset name
+            perf_params: Performance parameters
+            drop_benchmark: Exclude benchmark from results
+
+        Returns:
+            Tuple of (performance table, regime data dictionary)
+        """
+        regime_id_func_kwargs = dict(
+            prices=prices,
+            benchmark=benchmark,
+            include_start_date=True,
+            include_end_date=True
+        )
+
+        # Defer dynamic volatility IDs until the base method has classified this price panel.
+        return super().compute_regimes_pa_perf_table(
+            regime_id_func_kwargs=regime_id_func_kwargs,
+            prices=prices,
+            benchmark=benchmark,
+            perf_params=perf_params,
+            freq=self.freq,
+            is_report_pa_returns=True,
+            is_use_benchmark_means=False,
+            # Match the shared table contract while leaving component regime data intact.
+            drop_benchmark=drop_benchmark
+        )
+
+    def get_regime_colors(self) -> List[Tuple[float, ...]]:
+        """Get list of regime colors in order."""
+        return list(self.regime_colors.values())
+
+
+# ============================================================================
+# Convenience functions
+# ============================================================================
+
+def compute_bnb_regimes_pa_perf_table(prices: pd.DataFrame,
+                                      benchmark: str = None,
+                                      benchmark_price: pd.Series = None,
+                                      freq: str = 'QE',
+                                      return_type: ReturnTypes = ReturnTypes.RELATIVE,
+                                      q: Union[np.ndarray, int] = None,
+                                      regime_ids_colors: Dict[str, str] = None,
+                                      perf_params: PerfParams = None,
+                                      drop_benchmark: bool = False,
+                                      **kwargs) -> pd.DataFrame:
+    """Compute benchmark regime performance attribution table.
+
+    Convenience function for computing regime-conditional performance using the default
+    benchmark-return quantile classifier or a caller-supplied classifier.
+
+    Args:
+        prices: Asset price series
+        benchmark: Non-empty benchmark column name in prices, or explicit name for
+            ``benchmark_price``. The resolved name must occur at most once in prices.
+        benchmark_price: Alternative benchmark price series to add to prices. When ``benchmark``
+            is supplied, that explicit name takes precedence over the Series name. An existing
+            price column with the resolved name takes precedence over the Series values. When
+            ``benchmark`` is omitted, the Series name must be a non-empty string.
+        freq: Sampling frequency
+        return_type: Type of returns to compute
+        q: Quantile boundaries or number of quantiles
+        regime_ids_colors: Mapping of regime names to colors
+        perf_params: Performance parameters
+        drop_benchmark: Exclude benchmark from results
+        **kwargs: Compatibility options. A non-``None`` ``regime_classifier`` supplies the
+            complete classification policy and takes precedence over ``freq``, ``return_type``,
+            ``q``, and ``regime_ids_colors``. Other options remain ignored.
+
+    Returns:
+        Regime-conditional performance table
+
+    Raises:
+        ValueError: If neither benchmark source is provided, the resolved label is invalid or
+            duplicated in prices, a name-only source is absent, or benchmark_price is not a Series.
+    """
+    # Share source precedence with the benchmark-aware performance table before classification.
+    prices, benchmark = pt.resolve_benchmark_source(
+        prices=prices,
+        benchmark=benchmark,
+        benchmark_price=benchmark_price,
+    )
+
+    supplied_regime_classifier = kwargs.pop('regime_classifier', None)
+    if supplied_regime_classifier is None:
+        regime_classifier = BenchmarkReturnsQuantilesRegime(
+            freq=freq,
+            return_type=return_type,
+            q=q,
+            regime_ids_colors=regime_ids_colors
+        )
+    else:
+        # Honor the caller's complete classification policy instead of rebuilding its settings.
+        regime_classifier = cast(RegimeClassifier, supplied_regime_classifier)
+
+    regimes_pa_perf_table, regime_datas = regime_classifier.compute_regimes_pa_perf_table(
+        prices=prices,
+        benchmark=benchmark,
+        perf_params=perf_params,
+        drop_benchmark=drop_benchmark
+    )
+
+    return regimes_pa_perf_table
+
+def compute_regime_sharpe_decomposition(returns: Union[pd.Series, pd.DataFrame],
+                                        benchmark_returns: pd.Series,
+                                        af: float,
+                                        q: Union[np.ndarray, int] = None,
+                                        regime_ids: List[str] = None,
+                                        sharpe_convention: SharpeConvention = SharpeConvention.ARITHMETIC,
+                                        ddof: int = 1,
+                                        is_add_total: bool = True
+                                        ) -> Union[pd.Series, pd.DataFrame]:
+    """
+    returns-level additive regime Sharpe decomposition, sr_s = sqrt(af) * p_s * m_s / std
+    (sharpe_conventions.md sections 1 and 4)
+
+    the standalone counterpart of the regime-Sharpe branch of
+    compute_regimes_pa_perf_table_from_sampled_returns for callers that hold periodic
+    returns rather than prices: no resampling, no annualization inference (af is explicit),
+    and any index type is accepted (the index is never touched, so RangeIndex works)
+
+    classification uses pd.qcut on the benchmark returns with the same labels as the
+    regime classifier, so on an aligned panel without missing values the output equals the
+    table branch to machine precision. All moments are computed per asset over the rows
+    where both the asset and the benchmark are observed, which makes the decomposition
+    exactly additive per asset for any missing-value pattern:
+    sum_s sr_s = sqrt(af) * mean / std on that asset's sample
+
+    q defaults to the one-sigma boundaries np.array([0.0, 0.16, 0.84, 1.0])
+    (P(Z < -1) = 15.87% rounds to 16%, central mass 68% against the normal's 68.27%),
+    the single library-wide default shared with BenchmarkReturnsQuantilesRegime since 5.0.7
+
+    supported conventions: ARITHMETIC (on simple returns) and LOG (the same construction
+    on log(1 + r)), both exactly additive. PA does not decompose additively without the
+    c-adjustment: use compute_regimes_pa_perf_table_from_sampled_returns for the adjusted
+    p.a. regime bars
+    """
+    if not isinstance(benchmark_returns, pd.Series):
+        raise ValueError(f"benchmark_returns must be pd.Series, got {type(benchmark_returns)!r}")
+    if sharpe_convention == SharpeConvention.PA:
+        raise ValueError("PA regime Sharpe requires the c-adjusted table path: "
+                         "use compute_regimes_pa_perf_table_from_sampled_returns")
+    is_series = isinstance(returns, pd.Series)
+    returns_df = returns.to_frame() if is_series else returns
+    if not isinstance(returns_df, pd.DataFrame):
+        raise ValueError(f"returns must be pd.Series or pd.DataFrame, got {type(returns)!r}")
+    if q is None:
+        q = np.array([0.0, 0.16, 0.84, 1.0])
+
+    benchmark_valid = benchmark_returns.dropna()
+    if len(benchmark_valid) < 3:
+        raise ValueError(f"need at least 3 benchmark returns to classify, got {len(benchmark_valid)!r}")
+    n_buckets = int(q) if np.isscalar(q) else len(np.asarray(q)) - 1
+    if regime_ids is None:
+        regime_ids = ['Bear', 'Normal', 'Bull'] if n_buckets == 3 else [f"Q{n + 1}" for n in range(n_buckets)]
+    if len(regime_ids) != n_buckets:
+        raise ValueError(f"regime_ids must have {n_buckets} labels, got {regime_ids!r}")
+    regime_id = pd.qcut(x=benchmark_valid, q=q, labels=regime_ids)
+
+    if sharpe_convention == SharpeConvention.LOG:
+        returns_df = np.log1p(returns_df)
+
+    out = {}
+    for asset in returns_df.columns:
+        r = returns_df[asset].reindex(benchmark_valid.index).dropna()
+        regimes = regime_id.reindex(r.index)
+        sigma = r.std(ddof=ddof)
+        n = len(r)
+        row = {f"{regime}{RegimeData.REGIME_SHARPE.value}":
+               float(np.sqrt(af) * ((regimes == regime).sum() / n) * (r[regimes == regime].mean() if (regimes == regime).any() else 0.0) / sigma)
+               for regime in regime_ids}
+        if is_add_total:
+            row[f"Total{RegimeData.REGIME_SHARPE.value}"] = float(np.sqrt(af) * r.mean() / sigma)
+        out[asset] = row
+    table = pd.DataFrame.from_dict(out, orient='index')
+    return table.iloc[0] if is_series else table
