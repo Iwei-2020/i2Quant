@@ -1,0 +1,516 @@
+"""
+bar charts of the columns of a frame, one bar group per index entry.
+
+``plot_bars`` is the general one: columns are stacked within each group by default, since the
+usual subject is a decomposition whose total matters, and ``stacked=False`` places them side by
+side. For a ``pd.Series`` with a DatetimeIndex the index is converted to string labels before
+drawing, with ``x_date_freq`` and ``date_format`` choosing which entries carry a label; a
+DataFrame keeps its raw timestamps as labels. Either way the axis is categorical rather than a
+date axis. ``plot_vbars`` instead draws one horizontal bar per row, segments laid end to end,
+with the row total marked by a vertical rule.
+
+Bar values, group totals and legend statistics are annotations layered on top, set by
+``add_bar_values``, ``totals`` and ``legend_stats``; shared arguments are in
+``qis/docs/plotting_kwargs.md``. The same decomposition as filled areas is ``qis.plots.stackplot``.
+"""
+
+# packages
+import warnings
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib.transforms as transforms
+from typing import List, Tuple, Optional, Union
+from enum import Enum
+
+# qis
+import qis.utils.struct_ops as sop
+import qis.plots.utils as put
+from qis.plots.utils import LegendStats
+
+
+def plot_bars(df: Union[pd.DataFrame, pd.Series],
+              stacked: bool = True,
+              date_format: str = '%d-%b-%y',
+              x_date_freq: str = 'QE',
+              title: str = None,
+              fontsize: int = 10,
+              add_bar_values: bool = False,
+              add_top_bar_values: bool = False,
+              is_top_totals: bool = False,
+              totals: List[float] = None,
+              legend_stats: LegendStats = LegendStats.NONE,
+              xvar_format: str = '{:.1%}',
+              yvar_format: str = '{:,.2f}',
+              x_rotation: int = 90,
+              total_rotation: int = 0,
+              skip_y_axis: bool = False,
+              legend_loc: Optional[str] = 'upper center',
+              bbox_to_anchor: Optional[Tuple[float, float]] = None,
+              y_limits: Tuple[Optional[float], Optional[float]] = None,
+              annotate_totals: bool = True,
+              totals_offset: Tuple[float, float] = (2.55, 5),
+              series_color: str = 'steelblue',
+              colors: List[str] = None,
+              legend_labels: List[str] = None,
+              legend_colors: List[str] = None,
+              vline_columns: List[int] = None,
+              xlabel: str = None,
+              ylabel: str = None,
+              reverse_columns: bool = False,
+              is_sns: bool = True,
+              alpha: float = 0.9,
+              x_loc_width_shift: float = 0.2,
+              add_avg_line: bool = False,
+              is_horizontal: bool = False,
+              labels_frequency: Optional[int] = None,
+              ax: plt.Subplot = None,
+              **kwargs
+              ) -> Optional[plt.Figure]:
+    """
+    plot columns of a DataFrame as bars, grouped or stacked, one group per index entry.
+
+    Stacked is the default because the usual subject is a decomposition — exposures by asset
+    class, attribution by group — where the total is as interesting as the parts. Set
+    ``stacked=False`` for side-by-side comparison of series that do not sum to anything.
+
+    Arguments shared with every ``plot_*`` function are documented in
+    ``qis/docs/plotting_kwargs.md``.
+
+    Args:
+        df: values to draw, one bar group per index entry and one bar per column
+        stacked: stack the columns within each group rather than placing them side by side
+        date_format: strftime format for a DatetimeIndex on the category axis
+        add_bar_values: annotate each bar segment with its own value
+        add_top_bar_values: annotate only the topmost segment of a stacked group
+        is_top_totals: place the group total above the bar rather than inside it
+        totals: group totals to annotate. None computes the row sum, which is the total only
+            when the columns are additive; pass it explicitly when they are not
+        legend_stats: summary statistics appended to each legend entry
+        x_rotation: rotation in degrees of the category labels
+        total_rotation: rotation in degrees of the total annotations
+        skip_y_axis: draw no vertical axis, for a bar row read entirely from its labels
+        bbox_to_anchor: legend anchor passed to matplotlib, for placing the legend outside
+        annotate_totals: draw the totals at all
+        totals_offset: (x, y) offset in points of the total annotation from the bar
+        series_color: colour used when the frame has a single column and ``colors`` is None
+        legend_labels: replace the column names in the legend
+        legend_colors: legend swatch colours, when they should differ from the bar colours
+        vline_columns: positions after which to draw a vertical separator, to group categories
+        reverse_columns: reverse the column order, which reverses the stacking order
+        is_sns: draw through seaborn rather than matplotlib directly
+        alpha: bar opacity
+        x_loc_width_shift: horizontal offset of grouped bars within a category
+        add_avg_line: draw a horizontal line at the mean of the plotted values
+        is_horizontal: draw horizontal bars, which reads better with long category names
+        labels_frequency: label every nth category. None labels all of them
+
+    Returns:
+        the figure drawn on, or None when ``ax`` was supplied
+    """
+    if ax is None:
+        fig, ax = plt.subplots()
+    else:
+        fig = None
+
+    if df.empty:
+        warnings.warn('df is empty: no data to plot')
+        return fig
+
+    # convert to series to avoid melting
+    # if isinstance(df, pd.DataFrame) and len(df.columns) == 1:
+    #    df = df.iloc[:, 0]
+
+    if colors is None:
+        if isinstance(df, pd.Series):
+            colors = [series_color]
+        else:
+            #if stacked:
+            n = len(df.columns)
+            #else:
+            #    n = len(df.index)
+            colors = put.get_n_colors(n=n, **kwargs)
+
+    # use str for dates with plot.bar
+    if isinstance(df.index, pd.DatetimeIndex) and isinstance(df, pd.Series):
+        df, datalables = put.map_dates_index_to_str(data=df,
+                                                    x_date_freq=x_date_freq,
+                                                    date_format=date_format)
+        df.index = datalables
+        if is_horizontal:
+            df.plot.barh(stacked=stacked, color=colors, edgecolor='none', ax=ax)
+        else:
+            df.plot.bar(stacked=stacked, color=colors, edgecolor='none', ax=ax)
+
+    elif isinstance(df, pd.Series):
+        # sns.barplot(x=df.index, y=df, palette=colors, ax=ax)
+        if is_horizontal:
+            df.plot.barh(stacked=stacked, color=colors, edgecolor='none', ax=ax)
+        else:
+            df.plot.bar(stacked=stacked, color=colors, edgecolor='none', ax=ax)
+
+    else:  # need to melt for barplot
+        value_name = ylabel or 'y'
+        var_name = xlabel or 'x'
+        df1 = df.melt(ignore_index=False, var_name=var_name, value_name=value_name)
+        df1 = df1.dropna(subset=[value_name])  # dropna in value_name
+        if is_sns and not stacked:
+            sns.barplot(x=df1.index, y=value_name, data=df1, hue=var_name,
+                        palette=colors[:len(df1[var_name].unique())],
+                        edgecolor='none',
+                        orient='h' if is_horizontal else 'v',
+                        alpha=alpha,
+                        ax=ax)
+        else:
+            if is_horizontal:
+                df.plot.barh(stacked=stacked, color=colors, edgecolor='none', ax=ax)
+            else:
+                df.plot.bar(stacked=stacked, color=colors, edgecolor='none', ax=ax)
+
+    # put totals to bar and store locations
+    x_locs = []
+    x_mins = []
+    x_maxs = []
+    for p in ax.patches:
+        width, height = p.get_width(), p.get_height()
+        y = p.get_y()
+        x = p.get_x()
+        x_loc = x+x_loc_width_shift*width
+        y_loc = y+.3*height if height > 0.0 else y+0.8*height
+        if add_bar_values:
+            if height != 0:
+                ax.annotate(text=yvar_format.format(height), xy=(x_loc, y_loc), fontsize=fontsize, weight='normal',
+                            rotation=total_rotation)
+        elif add_top_bar_values:
+            if height != 0:
+                ymin, ymax = ax.get_ylim()
+                ax.annotate(text=yvar_format.format(height), xy=(x_loc, 0.95*ymax), fontsize=fontsize, weight='normal',
+                            rotation=total_rotation)
+
+        if x not in x_locs:
+            x_locs.append(x)  # take only one location per asset
+            x_mins.append(x)
+            x_maxs.append(x + width)
+
+    if totals is not None:
+        if is_top_totals:
+            ymin, ymax = ax.get_ylim()
+            ax.set_ylim(ymin, ymax * 1.1)
+
+        for total, x_loc, x_min, x_max in zip(totals, x_locs, x_mins, x_maxs):
+            label = yvar_format.format(total)
+            if is_top_totals:
+                trans = transforms.blended_transform_factory(ax.transData, ax.transAxes)
+                ax.text(x_min + 0.2 * (x_max - x_min), 0.975, label,
+                        transform=trans, fontsize=fontsize, weight='normal')
+            else:
+                ax.hlines(xmin=x_min, xmax=x_max, y=total, linestyle='-', color='black', linewidth=0.5)
+                if annotate_totals:
+                    ax.annotate(text=label, xytext=totals_offset, textcoords='offset points',
+                                xy=(x_max, total),
+                                fontsize=fontsize,
+                                ha='left', va='top')
+
+    if vline_columns is not None:
+        ylim = ax.get_ylim()
+        for vline_column in vline_columns:
+            ax.vlines([vline_column-0.5], *ylim, lw=1)  # shift by 0.5 for visibility
+
+    if legend_labels is not None:
+        labels = legend_labels
+    else:
+        # handles, labels = ax.get_legend_handles_labels()
+        labels = put.get_legend_lines(data=df, legend_stats=legend_stats, var_format=yvar_format)
+
+    if legend_colors is not None:
+        colors = legend_colors
+
+    put.set_legend(ax=ax,
+                   labels=labels,
+                   colors=colors,
+                   reverse_columns=reverse_columns,
+                   bbox_to_anchor=bbox_to_anchor,
+                   legend_loc=legend_loc,
+                   fontsize=fontsize,
+                   **kwargs)
+
+    for line in ax.get_legend().get_lines():
+        line.set_linewidth(4.0)
+
+    if add_avg_line:
+        avg = np.nanmean(df)
+        ax.axhline(avg, color='coral', linewidth=2, linestyle='--', label='Average')
+        xmin, xmax = ax.get_xlim()
+        ax.text(xmax, avg, f"Average", fontsize=fontsize, weight='normal', color='coral')
+
+    put.set_ax_xy_labels(ax=ax,
+                         fontsize=fontsize,
+                         xlabel=xlabel,
+                         ylabel=ylabel,
+                         **kwargs)
+
+    put.set_ax_tick_params(ax=ax)
+    local_kwargs = sop.update_kwargs(dict(yvar_format=yvar_format, xvar_format=xvar_format,  fontsize=fontsize), kwargs)
+    put.set_ax_ticks_format(ax=ax, x_rotation=x_rotation, **local_kwargs)
+    put.set_ax_tick_labels(ax=ax, fontsize=fontsize, skip_y_axis=skip_y_axis, **kwargs)
+
+    if is_horizontal:
+        ax.set_yticks(np.arange(len(df.index)), labels=df.index.to_list())
+        ax.xaxis.set_tick_params(rotation=x_rotation)
+        ax.invert_yaxis()  # labels read top-to-bottom
+    else:
+        ax.set_xticks(np.arange(len(df.index)), labels=df.index.to_list())
+        ax.xaxis.set_tick_params(rotation=x_rotation)
+        ax.axhline(0, color='black', lw=0.5)
+
+    if labels_frequency is not None:
+        put.set_labels_frequency(ax=ax, labels_frequency=labels_frequency)
+
+    if y_limits is not None:
+        put.set_y_limits(ax=ax, y_limits=y_limits)
+
+    put.set_spines(ax=ax, **kwargs)
+
+    if title is not None:
+        put.set_title(ax=ax, title=title, fontsize=fontsize)
+
+    return fig
+
+
+def plot_vbars(df: Union[pd.DataFrame, pd.Series],
+               title: Optional[str] = None,
+               fontsize: int = 10,
+               add_bar_values: bool = True,
+               add_bar_perc_values: bool = False,
+               var_format: str = '{:.1%}',
+               legend_loc: Optional[str] = 'upper center',
+               bbox_to_anchor: Optional[Tuple[float, float]] = (0.5, 1.04),
+               totals: List[float] = None,
+               colors: Union[List[str], List[Tuple[float, float, float]]] = None,
+               legend_labels: List[str] = None,
+               legend_colors: List[str] = None,
+               x_rotation: int = 0,
+               xmin_shift: Optional[float] = None,  # add shift to x-axis to left
+               add_bar_value_at_mid: bool = True,
+               add_total_bar: bool = True,
+               total_bar_linewidth: int = 2,
+               total_bar_linestyle: str = '-',
+               add_total_to_index: bool = False,
+               add_total_to_left: bool = False,
+               is_category_names_colors: bool = True,
+               x_step: Optional[float] = None,  # specify x-step
+               x_limits: Tuple[Union[float, None], Union[float, None]] = None,
+               reverse_columns: bool = True,
+               rows_edge_lines: List[int] = None,
+               axvline_color: Optional[str] = 'orange',
+               xlabel: str = None,
+               ax: plt.Subplot = None,
+               **kwargs
+               ) -> plt.Figure:
+    """
+    adopted for vertical bars
+    """
+    if ax is None:
+        height = put.calc_table_height(num_rows=len(df.index), scale=0.30)
+        fig, ax = plt.subplots(figsize=(9.2, height))
+    else:
+        fig = None
+
+    if df.empty:
+        warnings.warn('df is empty: no data to plot')
+        return fig
+
+    if isinstance(df, pd.Series):
+        df = df.to_frame()
+    category_names = df.columns.to_list()
+
+    if add_total_to_index and totals is not None:
+        df.index = [f"{x} {var_format.format(total)}" for x, total in zip(df.index, totals)]
+
+    # plot results = {index, column data as list}
+    results = {rdata[0]: rdata[1].to_list() for rdata in df.iterrows()}
+
+    # bars must be categorical: the value labels (ax.text) and the total markers (ax.vlines)
+    # below address rows by integer position, which barh only honours for non-numeric labels
+    labels = [str(x) for x in results.keys()]
+    np_data = np.array(list(results.values()))
+    if totals is None:
+        totals = np.sum(np_data, axis=1)
+
+    if colors is None:
+        if is_category_names_colors:  # heatmap for  color bars
+            if len(df.columns) == 1:
+                colors = put.compute_heatmap_colors(a=df.to_numpy(), axis=0)
+            else:
+                colors = put.compute_heatmap_colors(a=np.sum(df.to_numpy(), axis=1))
+        else:  # same colors for all bars
+            colors = put.get_n_colors(n=len(df.columns))
+    else:
+        if is_category_names_colors:  # same colors for all bars
+            legend_colors = colors
+            colors = np.tile(colors, len(category_names))
+        else:  # colors are given for each index
+            pass
+
+
+    if add_bar_value_at_mid:
+        bar_value_at_max = None
+    else:
+        bar_value_at_max = np.max(np.cumsum(np_data, axis=1))
+
+    ax.invert_yaxis()
+
+    # negative
+    last_starts = None
+    initial_starts = np.sum(np.where(np_data < 0.0, np_data, 0.0), axis=1)
+    for i, colname in enumerate(category_names):
+        # colors are indexed by row (one per bar), not by column: pass the whole array
+        col_colors = colors
+        widths = np.where(np_data[:, i] < 0.0, np_data[:, i], 0.0)
+        if last_starts is None:
+            starts = initial_starts
+            last_starts = initial_starts
+        else:
+            starts = last_starts
+        last_starts = last_starts + np.abs(widths)
+        ax.barh(labels, np.abs(widths), left=starts, height=0.5, label=colname, color=col_colors)
+
+        if add_bar_values:
+            xcenters = starts + np.abs(widths) / 2
+            text_color = 'black'
+            for y, (x, c) in enumerate(zip(xcenters, widths)):
+                if not np.isclose(c, 0.0):
+                    if add_bar_value_at_mid:
+                        x_loc = x
+                    else:
+                        x_loc = bar_value_at_max
+
+                    if add_bar_perc_values:
+                        label = f"{var_format.format(c)} / {'{:.0%}'.format(c/totals[y])}"
+                    else:
+                        label = var_format.format(c)
+                    ax.text(x_loc, y, label, ha='center', va='center', color=text_color, fontsize=fontsize)
+
+    # positive
+    last_starts = 0*last_starts
+    for i, colname in enumerate(category_names):
+        # colors are indexed by row (one per bar), not by column: pass the whole array
+        col_colors = colors
+
+        widths = np.where(np_data[:, i] > 0.0, np_data[:, i], 0.0)
+        if last_starts is None:
+            starts = 0
+            last_starts = widths
+        else:
+            starts = last_starts
+            last_starts = last_starts + widths
+        ax.barh(labels, widths, left=starts, height=0.5, label=colname, color=col_colors)
+
+        if add_bar_values:
+            xcenters = starts + widths / 2
+            text_color = 'black'
+            for y, (x, c) in enumerate(zip(xcenters, widths)):
+                if not np.isclose(c, 0.0):
+                    if add_bar_value_at_mid:
+                        x_loc = x
+                    else:
+                        x_loc = bar_value_at_max
+                    if add_bar_perc_values:
+                        label = f"{var_format.format(c)} / {'{:.0%}'.format(c/totals[y])}"
+                    else:
+                        label = var_format.format(c)
+
+                    ax.text(x_loc, y, label, ha='center', va='center', color=text_color, fontsize=fontsize)
+
+    if xmin_shift is not None:
+        xmin, xmax = ax.get_xlim()
+        xmin_ = xmin + xmin_shift
+        ax.set_xlim(xmin_, xmax)
+
+    if add_total_bar:
+        for idx, total in enumerate(totals):
+            ax.vlines(x=total, ymin=idx-0.25, ymax=idx+0.25, linestyle=total_bar_linestyle, color='black',
+                      linewidth=total_bar_linewidth)
+
+    if add_total_to_left:
+        widths = np.nansum(np.where(np_data > 0.0, np_data, 0.0), axis=1)
+        shift = np.maximum(0.2 * np.max(widths), 0.2)
+        for idx, total in enumerate(totals):
+            label = f"total: {var_format.format(total)}"
+            ax.text(widths[idx]+shift, idx, label, ha='center', va='center', fontsize=fontsize)
+
+    # legend
+    if legend_labels is None:
+        legend_labels = category_names
+        # handles, labels = ax.get_legend_handles_labels()
+
+    if legend_colors is not None:
+        legend_colors = legend_colors
+    else:
+        if is_category_names_colors: # cannot define on heatmap
+            legend_colors = None
+        else:
+            legend_colors = colors
+
+    # reverse
+    if reverse_columns:
+        legend_labels = legend_labels[::-1]
+        if legend_colors is not None:
+            legend_colors = legend_colors[::-1]
+
+    # remove padding
+    ax.margins(y=0.01)
+
+    put.set_legend(ax=ax,
+                   labels=legend_labels,
+                   colors=legend_colors,
+                   legend_loc=legend_loc,
+                   reverse_columns=True,
+                   bbox_to_anchor=bbox_to_anchor,
+                   fontsize=fontsize,
+                   **kwargs)
+
+    # increase line width
+    for line in ax.get_legend().get_lines():
+        line.set_linewidth(5.0)
+
+    if x_limits is not None:
+        put.set_x_limits(ax=ax, x_limits=x_limits)
+
+    # ax.xaxis.set_visible(False)
+    ax.grid(zorder=0, axis='x')
+    if axvline_color is not None:
+        ax.axvline(x=0, linewidth=2, color=axvline_color)
+
+    # barh places categorical bars at 0..n-1; pin the y locator to those positions so the
+    # label count matches, whatever the auto locator picked
+    ax.set_yticks(np.arange(len(labels)))
+    x_labels = [var_format.format(x) for x in ax.get_xticks()]
+    put.set_ax_tick_labels(ax=ax,
+                           x_labels=x_labels,
+                           y_labels=labels,
+                           fontsize=fontsize,
+                           x_rotation=x_rotation,
+                           **kwargs)
+
+    if xlabel is not None:
+        put.set_ax_xy_labels(ax=ax, xlabel=xlabel, ylabel=None, fontsize=fontsize, **kwargs)
+
+    put.set_spines(ax=ax, **kwargs)
+
+    if x_step is not None:
+        x_limits = (x_step*np.floor(np.min(np.cumsum(np.where(np_data < 0.0, np_data, 0.0), axis=1))/x_step),
+                    x_step*np.ceil(np.max(np.cumsum(np.where(np_data > 0.0, np_data, 0.0), axis=1))/x_step))
+
+        put.set_x_limits(ax=ax, x_limits=x_limits)
+
+    if rows_edge_lines is not None:
+        for rows_edge_line in rows_edge_lines:
+            ax.axhline(y=rows_edge_line-0.5, color='black', alpha=0.5)
+
+    if title is not None:
+        put.set_title(ax=ax, title=title, fontsize=fontsize, **kwargs)
+
+    return fig
+000
