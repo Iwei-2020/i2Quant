@@ -1,0 +1,186 @@
+"""
+regime-conditional exhibits: bars of performance by regime, and the regime shading on any axis.
+
+``plot_regime_data`` takes a ``RegimeClassifier`` and draws one bar per asset split into the
+regimes, in the classifier's own colours, with ``RegimeData`` selecting whether the bars are
+conditional Sharpe ratios, average or annualised returns. The classifier carries no data, so
+``prices``, ``benchmark`` and ``perf_params`` travel through ``**kwargs`` to its table method
+and are not optional. ``plot_regime_boxplot`` shows the dispersion behind the point estimates.
+
+``add_bnb_regime_shadows`` is the odd one out: it draws ``axvspan`` bands onto an existing
+``ax`` and returns None, so it is called after the panel it annotates and needs either
+``pivot_prices`` or a ``benchmark`` present in ``data_df``. The classification, the conditional
+tables and the Sharpe convention behind the bars are in ``qis/perfstats/regime_classifier.py``.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from typing import Optional, Tuple
+
+# qis
+import qis.utils.df_cut as dfc
+from qis.perfstats.config import RegimeData
+from qis.perfstats.regime_classifier import (RegimeClassifier,
+                                             BenchmarkReturnsQuantilesRegime)
+import qis.plots.bars as pba
+import qis.plots.boxplot as bxp
+
+
+def plot_regime_data(regime_classifier: RegimeClassifier,
+                     regime_data_to_plot: RegimeData = RegimeData.REGIME_SHARPE,
+                     drop_sharpe_from_labels: bool = False,  # only leave the regime names
+                     drop_benchmark: bool = False,
+                     x_rotation: int = 90,
+                     add_bar_values: bool = True,
+                     title: Optional[str] = 'Conditional Excess Sharpe ratio',
+                     var_format: str = '{:.1f}',
+                     bbox_to_anchor: Optional[Tuple[float, float]] = (1.0, 0.95),
+                     fontsize: int = 10,
+                     is_top_totals: bool = True,
+                     is_add_totals: bool = True,
+                     is_use_vbar: bool = False,
+                     reverse_columns: bool = True,
+                     legend_loc: Optional[str] = 'upper right',
+                     ax: plt.Subplot = None,
+                     **kwargs
+                     ) -> plt.Figure:
+    """plot regime-conditional data of the classifier as stacked bars with regime colors.
+
+    for regime_data_to_plot=RegimeData.REGIME_SHARPE the values follow
+    perf_params.sharpe_convention (see qis/docs/sharpe_conventions.md):
+    PA (default) divides the additivity-patched compound per-annum regime returns
+    by the annualized vol. ARITHMETIC computes sr_s = sqrt(af) * p_s * m_s / std(r)
+    on the sampled simple returns, so the regime bars sum to the total arithmetic
+    Sharpe ratio exactly; LOG is the analog on log(1+r). The additive conventions
+    are the natural choice for regime attribution.
+
+    Args:
+        drop_benchmark: Exclude the benchmark from the rendered regime bars while leaving the
+            classifier's component tables unchanged.
+    """
+    regimes_pa_perf_table, regime_datas = regime_classifier.compute_regimes_pa_perf_table(drop_benchmark=drop_benchmark,
+                                                                                          **kwargs)
+    data = regime_datas[regime_data_to_plot]
+    if drop_benchmark:
+        # Apply final-table membership without reindexing possibly repeated asset labels.
+        data = data.loc[data.index.isin(regimes_pa_perf_table.index)]
+    data = data.dropna(how='all', axis=0)  # remove data wit all rows nans
+
+    if drop_sharpe_from_labels:
+        data.columns = [x.replace(' Sharpe', '') for x in data.columns]
+
+    regime_colors = list(regime_classifier.get_regime_ids_colors().values())
+
+    if is_add_totals:
+        totals = np.nansum(data.to_numpy(), axis=1)
+    else:
+        totals = None
+
+    if is_use_vbar:
+        fig = pba.plot_vbars(df=data,
+                             x_rotation=x_rotation,
+                             colors=regime_colors,
+                             var_format=var_format,
+                             add_bar_values=add_bar_values,
+                             title=title,
+                             totals=totals,
+                             fontsize=fontsize,
+                             bbox_to_anchor=bbox_to_anchor,
+                             xmin_shift=-0.05,
+                             x_step=0.5,
+                             ax=ax,
+                             **kwargs)
+    else:
+        fig = pba.plot_bars(df=data,
+                            x_rotation=x_rotation,
+                            colors=regime_colors,
+                            xvar_format=var_format,
+                            add_bar_values=add_bar_values,
+                            title=title,
+                            totals=totals,
+                            is_top_totals=is_top_totals,
+                            fontsize=fontsize,
+                            bbox_to_anchor=bbox_to_anchor,
+                            legend_loc=legend_loc,
+                            reverse_columns=reverse_columns,
+                            ax=ax,
+                            **kwargs)
+    return fig
+
+
+def plot_regime_boxplot(regime_classifier: RegimeClassifier,
+                        prices: pd.DataFrame,
+                        benchmark: str,
+                        hue_var_name: str = 'Asset',
+                        x_index_var_name: str = 'Regime',
+                        ylabel: str = 'avg regime return',
+                        x_rotation: int = 90,
+                        legend_loc: Optional[str] = 'upper left',
+                        yvar_format: str = '{:.0%}',
+                        meanline: bool = True,
+                        ax: plt.Subplot = None,
+                        **kwargs
+                        ) -> plt.Figure:
+
+    df = regime_classifier.compute_sampled_returns_with_regime_id(prices=prices, benchmark=benchmark).iloc[1:, :]
+    regime_ids_colors = regime_classifier.get_regime_ids_colors()
+    df = df.set_index(regime_classifier.REGIME_COLUMN, drop=True) # boxplot b regime as hue
+    df = dfc.sort_index_by_hue(df=df, hue_order=list(regime_ids_colors.keys()))
+    fig = bxp.df_boxplot_by_hue_var(df=df,
+                                    hue_var_name=hue_var_name,
+                                    x_index_var_name=x_index_var_name,
+                                    y_var_name=ylabel,
+                                    add_zero_line=True,
+                                    meanline=meanline,
+                                    is_heatmap_colors=False,
+                                    labels=prices.columns,
+                                    legend_loc=legend_loc,
+                                    x_rotation=x_rotation,
+                                    yvar_format=yvar_format,
+                                    ax=ax,
+                                    **kwargs)
+    return fig
+
+
+def add_bnb_regime_shadows(ax: plt.Subplot,
+                           data_df: pd.DataFrame = None,
+                           benchmark: str = None,
+                           pivot_prices: pd.Series = None,
+                           regime_classifier: BenchmarkReturnsQuantilesRegime = None,
+                           is_force_lim: bool = True,
+                           alpha: float = 0.3,
+                           **kwargs
+                           ) -> None:
+
+    if regime_classifier is None:
+        regime_classifier = BenchmarkReturnsQuantilesRegime()
+
+    if pivot_prices is not None:
+        benchmark = pivot_prices.name
+    elif benchmark is not None and data_df is not None:
+        if benchmark in data_df.columns:
+            pivot_prices = data_df[benchmark]
+        else:
+            raise KeyError(f"{benchmark} not in {data_df.columns}")
+    else:
+        raise ValueError("need pivot_prices or benchmark")
+
+    regime_ids = regime_classifier.compute_sampled_returns_with_regime_id(prices=pivot_prices,
+                                                                          benchmark=benchmark,
+                                                                          **regime_classifier.to_dict())
+
+    regime_id_color = regime_classifier.class_data_to_colors(regime_data=regime_ids[regime_classifier.REGIME_COLUMN])
+
+    # fill in the first date before the class date
+    price_data_index = pivot_prices.index
+
+    ax.axvspan(xmin=price_data_index[0],
+               xmax=regime_ids.index[0],
+               alpha=alpha,
+               color=regime_id_color.loc[regime_id_color.index[0]], lw=0)
+    for date_1, date in zip(regime_ids.index[:-1], regime_ids.index[1:]):
+        ax.axvspan(xmin=date_1, xmax=date, alpha=alpha, color=regime_id_color[date], lw=0)
+    if is_force_lim:
+        ax.set_xlim(price_data_index[0], regime_ids.index[-1])
