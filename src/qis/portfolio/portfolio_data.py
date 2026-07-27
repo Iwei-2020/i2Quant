@@ -1,0 +1,2057 @@
+"""
+the ``PortfolioData`` contract: what a backtest result carries, and what may be asked of it.
+
+``PortfolioData`` is what every portfolio in the stack hands to the reporting layer. It is a
+dataclass of aligned panels - ``nav``, ``prices``, ``units``, ``weights``, ``instrument_pnl``,
+``realized_costs`` - of which only ``nav`` is required; the rest are filled in ``__post_init__``
+as a delta-one holding of the nav itself, which reports correctly but has nothing to attribute.
+
+Units, not weights, are the state carried between rebalancings. ``weights`` therefore holds the
+realised weights implied by the units held, w_t = u_t p_t / nav_t, which drift with prices away
+from the targets that were requested; ``input_weights`` keeps those targets for comparison.
+Reading ``weights`` as the target is the most common misuse of this class.
+
+Conventions that hold module-wide:
+
+    Turnover delegates to :func:`qis.compute_turnover`. Executed unit changes are valued with
+        ``turnover_unit_notional`` rather than necessarily with return ``prices``. The default is
+        two-sided executed notional divided by nav; target-weight, gross-exposure, and
+        volatility-normalized target-weight conventions are explicit
+        ``TurnoverComputationType`` members. The volatility-normalized convention requires an
+        aligned panel of annualized volatilities and deliberately excludes drift and execution.
+        Turnover is summed over a rolling ``roll_period``, 260 observations by default.
+
+    ``instrument_pnl`` is arithmetic and additive across instruments. When not supplied it is
+        reconstructed as prices.pct_change() * weights.shift(1) with missing values filled to
+        zero, so a backtester computing pnl on another convention should pass it explicitly.
+
+    ``covar_dict``, annualised covariance by date, is read by
+        ``compute_ex_anti_portfolio_vol_implied_by_covar`` and
+        ``compute_risk_contributions_implied_by_covar`` and by nothing else here. The VaR
+        accessors do not use it; they estimate from prices and weights at ``vol_span``.
+
+Three accessor families: ``get_*`` return the stored panels sliced and aggregated, ``compute_*``
+derive risk and attribution quantities, and ``plot_*`` draw one panel, onto a supplied ``ax``
+wherever the panel is a single axis. ``AttributionMetric`` selects what is attributed and
+``SnapshotPeriod`` which summary of a risk series a snapshot panel shows. The factsheets that
+assemble these panels into a document live in ``qis/portfolio/reports/``.
+"""
+from __future__ import annotations
+
+# packages
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from numba import njit
+from dataclasses import dataclass
+from typing import Union, Dict, Any, Optional, Tuple, List
+from enum import Enum
+
+# qis
+import qis as qis
+from qis import TimePeriod, PerfStat, PerfParams, RegimeData, EnumMap, BenchmarkReturnsQuantilesRegime, RollingPerfStat
+import qis.utils.df_groups as dfg
+import qis.utils.df_agg as dfa
+import qis.perfstats.returns as ret
+import qis.perfstats.perf_stats as rpt
+import qis.plots.time_series as pts
+import qis.plots.stackplot as pst
+import qis.plots.utils as put
+import qis.plots.derived.prices as ppd
+import qis.plots.derived.perf_table as ppt
+import qis.plots.derived.returns_scatter as prs
+import qis.plots.derived.returns_heatmap as rhe
+from qis.models.linear.ewm import compute_ewm_vol
+import qis.portfolio.risk.ewm_factor_model as ef
+from qis.portfolio.signal_data import StrategySignalData
+from qis.portfolio.risk.ewm_covar_risk import compute_portfolio_vol
+from qis.portfolio.risk.contributions import compute_portfolio_risk_contributions
+from qis.utils.annualisation import infer_annualisation_factor_from_df
+from qis.utils.df_str import date_to_str
+from qis.perfstats.turnover import (
+    TurnoverComputationType,
+    compute_turnover,
+    resolve_turnover_computation_type,
+)
+
+# default performance and regime params
+PERF_PARAMS = PerfParams(freq='W-WED')
+regime_classifier = BenchmarkReturnsQuantilesRegime(freq='ME')
+
+
+def reduce_attribution_to_tails(data: pd.Series,
+                                max_bars: int
+                                ) -> Tuple[pd.Series, float]:
+    """
+    keep the extremes of an attribution and fold the middle into a reported total.
+
+    Sorted descending and cut from both ends when the values carry both signs - a P&L
+    attribution, where the losers matter as much as the winners - and from the top only when they
+    do not, which is every share-of-total metric: a risk attribution, costs and turnover are
+    non-negative by construction and have no bottom tail to show.
+
+    The folded value is returned rather than plotted. A single bar carrying sixty instruments
+    dominates the axis and flattens the ones the panel exists to show, so the caller states it in
+    the title instead.
+
+    Args:
+        data: attributed value per instrument
+        max_bars: bars to keep. Split evenly between the two ends when the data is two-sided
+
+    Returns:
+        (kept, folded_value): the retained entries in sorted order, and the sum of what was
+        dropped, so that kept.sum() + folded_value is the original total
+
+    Raises:
+        ValueError: if max_bars is not positive
+    """
+    if max_bars <= 0:
+        raise ValueError(f"max_bars must be positive, got {max_bars!r}")
+    ordered = data.sort_values(ascending=False)
+    if len(ordered.index) <= max_bars:
+        return ordered, 0.0
+    is_two_sided = bool(np.nanmin(ordered) < 0.0 < np.nanmax(ordered))
+    if is_two_sided:
+        n_head = max_bars // 2
+        n_tail = max_bars - n_head
+        kept = pd.concat([ordered.iloc[:n_head], ordered.iloc[len(ordered.index) - n_tail:]])
+    else:
+        kept = ordered.iloc[:max_bars]
+    folded_value = float(np.nansum(ordered.to_numpy()) - np.nansum(kept.to_numpy()))
+    return kept, folded_value
+
+
+class AttributionMetric(str, Enum):
+    """
+    input for computation of get_performance_attribution_data()
+    """
+    PNL = 'P&L Attribution, sum=portfolio performance'
+    PNL_RISK = 'P&L Risk Attribution, sum=100%'
+    INST_PNL = 'Instrument P&L'
+    COSTS = 'Instrument Total Costs'
+    TURNOVER = 'Instrument Annualised Turnover'
+    VOL_ADJUSTED_TURNOVER = 'Instrument Annualised Volatility-Normalized Weight Turnover'
+
+
+class SnapshotPeriod(str, Enum):
+    """
+    input for computation of get_performance_attribution_data()
+    """
+    LAST = 'last'
+    AVG = 'avg'
+    MAX = 'max'
+
+
+@dataclass
+class PortfolioData:
+    """
+    the contract every portfolio in the stack satisfies, and the input to the factsheet layer.
+
+    Produced either by :func:`qis.backtest_model_portfolio` or by an external backtester whose
+    outputs match these fields; in the second case ``strategy_signal_data`` can carry the
+    signals that drove the weights so the signal panels render too.
+
+    Only ``nav`` is required. Everything else is derived in ``__post_init__`` when omitted, and
+    the defaults describe a single-instrument delta-one holding of the nav itself: ``prices``
+    becomes the nav as a one-column frame, ``weights`` and ``units`` become 1.0, costs become
+    0.0, and each instrument becomes its own group. A portfolio built that way reports
+    correctly but has nothing to attribute, so pass the panels if attribution is wanted.
+
+    ``instrument_pnl``, when not given, is reconstructed as
+    ``prices.pct_change() * weights.shift(1)`` — arithmetic returns on lagged weights. Pass it
+    explicitly if the backtester computed pnl on a different convention.
+
+    Attributes:
+        nav: portfolio nav, net of all costs and fees. The only required field
+        weights: realised weights per instrument, which drift with prices between
+            rebalancings; these are not the target weights that were requested
+        units: instrument units held
+        prices: prices of the portfolio universe
+        turnover_unit_notional: value of one unit for turnover. Defaults to ``prices`` for cash
+            instruments; derivative backtests should supply contract notionals
+        turnover_computation_type: default turnover convention for this portfolio
+        instrument_pnl: net pnl by instrument
+        realized_costs: trading costs actually incurred, by instrument
+        input_weights: the target weights as supplied, kept for reference against ``weights``
+        is_rebalancing: flag per date marking where rebalancing took place
+        tickers_to_names_map: display names for long or opaque tickers
+        group_data: asset-class label per ticker, indexed by ticker; drives every grouped
+            panel in the factsheets. Defaults to one group per instrument
+        group_order: display order of the groups
+        instrument_names: long names per ticker
+        benchmark_prices: benchmark panel, reindexed onto the nav index and forward filled
+        ticker: portfolio name; taken from ``nav.name`` when omitted
+        strategy_signal_data: signals behind the weights, for the signal factsheet panels
+        covar_dict: annualised covariance matrix per date, required for risk contributions
+            and tracking error
+    """
+    nav: pd.Series  # nav is computed with all cost
+    weights: pd.DataFrame = None  # weights of portfolio
+    units: pd.DataFrame = None  # units of portfolio instruments
+    prices: pd.DataFrame = None  # prices of portfolio universe
+    instrument_pnl: pd.DataFrame = None  # include net pnl by instrument
+    realized_costs: pd.DataFrame = None  # realized trading costs by instrument
+    input_weights: Union[np.ndarray, pd.DataFrame, Dict[str, float]] = None  # inputs to potfolio
+    is_rebalancing: pd.Series = None  # optional info when the weights are rebalanced
+    tickers_to_names_map: Optional[Dict[str, str]] = None  # renaming of long tickers
+    group_data: pd.Series = None  # for asset class grouping
+    group_order: List[str] = None
+    instrument_names: pd.Series = None
+    benchmark_prices: pd.DataFrame = None  # can pass benchmark prices here
+    ticker: str = None
+    strategy_signal_data: StrategySignalData = None
+    covar_dict: Dict[pd.Timestamp, pd.DataFrame] = None  # for computing risk contributions
+    turnover_unit_notional: pd.DataFrame = None  # unit or contract value used for turnover
+    turnover_computation_type: TurnoverComputationType = (
+        TurnoverComputationType.EXECUTED_NOTIONAL_NAV
+    )
+
+    def __post_init__(self):
+        if isinstance(self.nav, pd.DataFrame):
+            self.nav = self.nav.iloc[:, 0]
+        if self.prices is None:
+            self.prices = self.nav.to_frame()
+        if self.weights is None:  # default will be delta-1 portfolio of nav
+            self.weights = pd.DataFrame(1.0, index=self.prices.index, columns=self.prices.columns)
+        if self.units is None:  # default will be delta-1 portfolio of nav
+            self.units = pd.DataFrame(1.0, index=self.prices.index, columns=self.prices.columns)
+        if self.turnover_unit_notional is None:
+            self.turnover_unit_notional = self.prices
+        self.turnover_computation_type = TurnoverComputationType(
+            self.turnover_computation_type
+        )
+        if self.realized_costs is None:
+            self.realized_costs = pd.DataFrame(0.0, index=self.prices.index, columns=self.prices.columns)
+        if self.instrument_pnl is None:
+            self.instrument_pnl = self.prices.pct_change(fill_method=None).multiply(self.weights.shift(1)).fillna(0.0)
+        if self.group_data is None:  # use instruments as groups
+            self.group_data = pd.Series(self.prices.columns, index=self.prices.columns)
+        if self.group_order is None:
+            self.group_order = list(self.group_data.unique())
+        if self.benchmark_prices is not None:
+            self.benchmark_prices = self.benchmark_prices.reindex(index=self.nav.index, method='ffill')
+        if self.ticker is None:
+            self.ticker = str(self.nav.name)
+
+    def _get_nav_for_report_index(
+        self,
+        report_index: pd.Index,
+        report_name: str,
+    ) -> pd.Series:
+        """Return NAV aligned to an identical, unique report index.
+
+        Args:
+            report_index: Row labels of the numerator being normalized.
+            report_name: User-facing name used in validation errors.
+
+        Returns:
+            NAV reindexed into the numerator's row order.
+
+        Raises:
+            ValueError: If either index is non-unique or their label sets differ.
+        """
+        if not self.nav.index.is_unique:
+            raise ValueError(f"NAV index must contain unique labels for {report_name}")
+        if not report_index.is_unique:
+            raise ValueError(f"{report_name} report index must contain unique labels")
+
+        if report_index.size != self.nav.index.size or not report_index.isin(
+            self.nav.index
+        ).all():
+            raise ValueError(
+                f"NAV index and {report_name} report index must contain identical labels"
+            )
+        return self.nav.reindex(report_index)
+
+    def set_ticker(self, ticker: str) -> PortfolioData:
+        self.ticker = ticker
+        self.nav = self.nav.rename(ticker)
+        return self
+
+    def set_benchmark_prices(self, benchmark_prices: Union[pd.Series, pd.DataFrame]) -> None:
+        # can pass benchmark prices here
+        if isinstance(benchmark_prices, pd.Series):
+            benchmark_prices = benchmark_prices.to_frame()
+        self.benchmark_prices = benchmark_prices.reindex(index=self.nav.index, method='ffill')
+
+    def set_group_data(self, group_data: pd.Series, group_order: List[str] = None) -> None:
+        self.group_data = group_data
+        if group_order is None:
+            group_order = group_data.to_list()
+        self.group_order = group_order
+
+    def save(self, ticker: str, local_path: str = './') -> None:
+        datasets = dict(nav=self.nav, prices=self.prices, weights=self.weights, units=self.units,
+                        turnover_unit_notional=self.turnover_unit_notional,
+                        turnover_computation_type=pd.Series(
+                            [self.turnover_computation_type.value],
+                            name='turnover_computation_type',
+                        ),
+                        instrument_pnl=self.instrument_pnl, realized_costs=self.realized_costs)
+        if self.group_data is not None:
+            datasets['group_data'] = self.group_data
+        qis.save_df_dict_to_csv(datasets=datasets, file_name=ticker, local_path=local_path)
+        print(f"saved portfolio data for {ticker}")
+
+    @classmethod
+    def load(cls, ticker: str) -> PortfolioData:
+        dataset_keys = ['nav', 'prices', 'weights', 'units', 'turnover_unit_notional',
+                        'turnover_computation_type', 'instrument_pnl', 'realized_costs',
+                        'group_data']
+        datasets = qis.load_df_dict_from_csv(dataset_keys=dataset_keys, file_name=ticker)
+        turnover_computation_type = datasets.pop('turnover_computation_type', None)
+        if turnover_computation_type is not None:
+            datasets['turnover_computation_type'] = turnover_computation_type.iloc[0, 0]
+        return cls(**datasets)
+
+    """
+    NAV level getters
+    """
+
+    def get_portfolio_nav(self, time_period: TimePeriod = None, freq: Optional[str] = None,
+                          ticker: Optional[str] = None) -> pd.Series:
+        """
+        get nav using consistent function for all return computations
+        """
+        if time_period is not None:
+            nav_ = time_period.locate(self.nav)
+        else:
+            nav_ = self.nav.copy()
+        if freq is not None:
+            nav_ = qis.df_asfreq(df=nav_, freq=freq)
+        if ticker is not None:
+            nav_ = nav_.rename(ticker)
+        return nav_
+
+    def get_portfolio_nav_with_benchmark_prices(self,
+                                                time_period: TimePeriod = None,
+                                                freq: Optional[str] = None
+                                                ) -> pd.DataFrame:
+        """
+        get nav using consistent function for all return computations
+        """
+        navs = self.get_portfolio_nav(time_period=time_period, freq=freq)
+        if self.benchmark_prices is not None:
+            benchmark_prices = self.benchmark_prices.reindex(index=navs.index, method='ffill')
+            navs = pd.concat([navs, benchmark_prices], axis=1, sort=True)
+        return navs
+
+    def get_instruments_pnl(self,
+                            add_total: bool = False,
+                            time_period: TimePeriod = None,
+                            is_net: bool = False,
+                            is_unit_based_traded_volume: bool = True,
+                            is_compounded: bool = False,
+                            freq: Optional[str] = None
+                            ) -> pd.DataFrame:
+        pnl = self.instrument_pnl.copy()
+        if is_net:
+            costs = self.get_costs(add_total=False, is_unit_based_traded_volume=is_unit_based_traded_volume)
+            pnl = pnl.subtract(costs)
+        if add_total:
+            pnl.insert(loc=0, value=pnl.sum(axis=1), column='Total')
+        if time_period is not None:
+            pnl = time_period.locate(pnl)
+        if freq is not None:
+            pnl = pnl.resample(freq).sum()
+        if is_compounded:
+            pnl = np.expm1(pnl)
+        return pnl
+
+    def get_performance_attribution(self,
+                                    add_total: bool = True,
+                                    time_period: TimePeriod = None,
+                                    is_compounded: bool = False
+                                    ) -> pd.Series:
+        instrument_pnl = self.get_instruments_pnl(add_total=add_total,
+                                                  time_period=time_period,
+                                                  is_compounded=is_compounded)
+        if is_compounded:
+            performance_attribution = instrument_pnl.iloc[-1, :] - 1.0
+        else:
+            performance_attribution = instrument_pnl.sum(axis=0)
+        return performance_attribution
+
+    def get_instruments_navs(self,
+                             time_period: TimePeriod = None,
+                             constant_trade_level: bool = False
+                             ) -> pd.DataFrame:
+        pnl = self.get_instruments_pnl(time_period=time_period, is_compounded=False).fillna(0.0)
+        navs = ret.returns_to_nav(returns=pnl, constant_trade_level=constant_trade_level)
+        return navs
+
+    def get_group_navs(self,
+                       time_period: TimePeriod = None,
+                       constant_trade_level: bool = False,
+                       is_add_group_total: bool = False
+                       ) -> Optional[pd.DataFrame]:
+        """
+        group total will exclude transaction costs so it is not equal to portfolio nav
+        """
+        if is_add_group_total:
+            total_column = str(self.nav.name)
+        else:
+            total_column = None
+        df = self.get_instruments_pnl(time_period=time_period)
+        if df.empty:
+            print(f"instruments p&l is not available for time_period={time_period.to_str()}")
+            group_navs = None
+        else:
+            grouped_pnl = dfg.agg_df_by_groups_ax1(df=df,
+                                                   group_data=self.group_data,
+                                                   agg_func=np.nansum,
+                                                   total_column=total_column,
+                                                   group_order=self.group_order)
+            group_navs = ret.returns_to_nav(returns=grouped_pnl, constant_trade_level=constant_trade_level)
+        return group_navs
+
+    def get_total_nav_with_group_navs(self, time_period: TimePeriod = None) -> pd.DataFrame:
+        """
+        group total will exclude transaction costs so it is not equal to portfolio nav
+        """
+        total_nav = self.get_portfolio_nav(time_period=time_period)
+        group_navs = self.get_group_navs(time_period=time_period, is_add_group_total=False)
+        prices = pd.concat([total_nav, group_navs], axis=1, sort=True)
+        return prices
+
+    def get_input_weights(self, time_period: TimePeriod = None) -> Union[np.ndarray, pd.DataFrame, Dict[str, float]]:
+        input_weights = self.input_weights.copy()
+        if time_period is not None and isinstance(input_weights, pd.DataFrame):
+            input_weights = time_period.locate(input_weights)
+        return input_weights
+
+    def get_weights(self,
+                    is_input_weights: bool = False,
+                    columns: List[str] = None,
+                    time_period: TimePeriod = None,
+                    is_grouped: bool = False,
+                    add_total: bool = False,
+                    freq: Optional[str] = 'W-WED',
+                    group_data: pd.Series = None,
+                    group_order: List[str] = None
+                    ) -> pd.DataFrame:
+        if is_input_weights and self.input_weights is not None and isinstance(self.input_weights, pd.DataFrame):
+            weights = self.input_weights.copy()
+        else:
+            weights = self.weights.copy()
+        if freq is not None:
+            weights = weights.resample(freq).last().ffill()
+
+        if is_grouped:
+            if group_data is None:
+                group_data = self.group_data
+            if group_order is None:
+                group_order = self.group_order
+            weights = dfg.agg_df_by_groups_ax1(df=weights,
+                                               group_data=group_data,
+                                               agg_func=np.nansum,
+                                               total_column=self.ticker if add_total else None,
+                                               group_order=group_order)
+        elif columns is not None:
+            weights = weights[columns]
+
+        if time_period is not None:
+            weights = time_period.locate(weights)
+
+        return weights
+
+    def get_grouped_long_short_weights(self,
+                                       time_period: TimePeriod = None,
+                                       total_name: str = 'Total',
+                                       weights_freq: Optional[str] = 'W-WED',
+                                       total_column: Optional[str] = None
+                                       ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+        """Computes grouped net long/short exposures by instrument groups.
+
+        Groups portfolio weights by predefined instrument categories and calculates
+        aggregate exposure metrics including total exposure, net long positions, and
+        net short positions for each group.
+
+        Args:
+            time_period: Time period for which to calculate exposures. If None,
+                uses the full available time series.
+            total_name: Column name for the total exposure aggregation.
+                Defaults to 'Total'.
+            weights_freq: Frequency for resampling exposures data.
+                Defaults to 'W-WED' (weekly on Wednesday).
+            total_column: Column name for total in group dictionary. If None,
+                no total column is included in grouping.
+        Returns:
+            A tuple containing:
+                - grouped_weights_agg: Dictionary mapping group names to DataFrames
+                  with columns for total, net long, and net short exposures.
+                - grouped_weights_by_inst: Dictionary mapping group names to
+                  DataFrames containing individual instrument exposures within
+                  each group.
+
+        Note:
+            Positive exposures represent long positions, negative exposures
+            represent short positions. Net long sums only positive values,
+            net short sums only negative values.
+        """
+        group_dict = dfg.get_group_dict(group_data=self.group_data,
+                                        group_order=self.group_order,
+                                        total_column=total_column)
+        all_exposures = self.get_weights(time_period=time_period, freq=weights_freq)
+        grouped_weights_by_inst = {}
+        grouped_weights_agg = {}
+        for group, tickers in group_dict.items():
+            exposures_by_inst = all_exposures[tickers]
+            grouped_weights_by_inst[group] = exposures_by_inst
+            total = dfa.df_nansum(exposures_by_inst, axis=1).rename(total_name)
+            net_long = dfa.df_nansum_positive(exposures_by_inst, axis=1).rename('Net Long')
+            net_short = dfa.df_nansum_negative(exposures_by_inst, axis=1).rename('Net Short')
+            grouped_weights_agg[group] = pd.concat([total, net_long, net_short], axis=1, sort=True)
+        return grouped_weights_agg, grouped_weights_by_inst
+
+    def get_grouped_cum_pnls(self,
+                             total_name: str = 'Total',
+                             time_period: TimePeriod = None
+                             ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+        """
+        compute grouped net long / short exposues
+        """
+        group_dict = dfg.get_group_dict(group_data=self.group_data,
+                                        group_order=self.group_order,
+                                        total_column=None)
+
+        pnls = self.get_instruments_pnl(time_period=time_period, is_compounded=False).fillna(0.0)
+        all_exposures = self.get_weights(time_period=time_period, freq=None)
+        all_exposures = all_exposures.reindex(index=pnls.index, method='ffill').ffill()
+        pnl_positive_exp = pnls.where(all_exposures > 0.0, other=0.0)
+        pnl_negative_exp = pnls.where(all_exposures < 0.0, other=0.0)
+
+        grouped_pnls_by_inst = {}
+        grouped_pnls_agg = {}
+        for group, tickers in group_dict.items():
+            pnls_by_inst = pnls[tickers]
+            grouped_pnls_by_inst[group] = pnls_by_inst.cumsum(axis=0)
+            total = dfa.df_nansum(pnls_by_inst, axis=1).rename(total_name)
+            net_long = dfa.df_nansum(pnl_positive_exp[tickers], axis=1).rename('Net Long')
+            net_short = dfa.df_nansum(pnl_negative_exp[tickers], axis=1).rename('Net Short')
+            grouped_pnls_agg[group] = pd.concat([total, net_long, net_short],
+                                                axis=1, sort=True).cumsum(axis=0)
+        return grouped_pnls_agg, grouped_pnls_by_inst
+
+    def get_turnover(self,
+                     is_agg: bool = False,
+                     is_grouped: bool = False,
+                     group_data: pd.Series = None,
+                     group_order: List[str] = None,
+                     time_period: TimePeriod = None,
+                     roll_period: Optional[int] = 260,
+                     is_vol_adjusted: bool = False,
+                     add_total: bool = True,
+                     vol_span: int = 33,
+                     freq: Optional[str] = None,
+                     is_unit_based_traded_volume: Optional[bool] = None,
+                     turnover_computation_type: Optional[TurnoverComputationType] = None,
+                     vols: Optional[pd.DataFrame] = None,
+                     **kwargs
+                     ) -> Union[pd.DataFrame, pd.Series]:
+        turnover_computation_type = resolve_turnover_computation_type(
+            default=self.turnover_computation_type,
+            computation_type=turnover_computation_type,
+            is_unit_based_traded_volume=is_unit_based_traded_volume,
+        )
+        if (is_vol_adjusted
+                and turnover_computation_type
+                == TurnoverComputationType.VOLATILITY_NORMALIZED_WEIGHTS):
+            raise ValueError(
+                "is_vol_adjusted cannot be combined with "
+                "VOLATILITY_NORMALIZED_WEIGHTS"
+            )
+        turnover = compute_turnover(
+            computation_type=turnover_computation_type,
+            units=self.units,
+            unit_notional=self.turnover_unit_notional,
+            nav=self.nav,
+            input_weights=self.input_weights,
+            vols=vols,
+        )
+
+        if is_vol_adjusted:
+            instrument_vols = compute_ewm_vol(data=qis.to_returns(self.prices, is_log_returns=True),
+                                              span=vol_span,
+                                              annualize=True)
+            turnover = turnover.multiply(instrument_vols)
+
+        all_missing_turnover = turnover.isna().all(axis=1)
+        if is_agg:
+            turnover = turnover.sum(axis=1, min_count=1).rename(self.nav.name)
+            turnover = turnover.reindex(index=self.nav.index)
+        elif is_grouped:  # agg by groups
+            if group_data is None:
+                group_data = self.group_data
+            if group_order is None:
+                group_order = self.group_order
+            turnover = dfg.agg_df_by_groups_ax1(df=turnover,
+                                                group_data=group_data,
+                                                agg_func=np.nansum,
+                                                total_column=str(self.nav.name) if add_total else None,
+                                                group_order=group_order)
+            turnover.loc[all_missing_turnover] = np.nan
+        else:
+            if add_total:
+                turnover = pd.concat([turnover.sum(axis=1, min_count=1).rename(self.nav.name),
+                                      turnover],
+                                     axis=1, sort=True)
+
+        if not turnover.empty:  # it may happen for undefined groupings
+            if freq is not None:  # first aggregate by freq
+                turnover = turnover.resample(freq).sum(min_count=1)
+            if roll_period is not None:  # now aggregate by roll
+                turnover = turnover.rolling(roll_period).sum()
+            if time_period is not None:
+                turnover = time_period.locate(turnover)
+        return turnover
+
+    def get_costs(self,
+                  is_agg: bool = False,
+                  is_grouped: bool = False,
+                  time_period: TimePeriod = None,
+                  add_total: bool = True,
+                  is_unit_based_traded_volume: Optional[bool] = None,
+                  roll_period: Optional[int] = 260,
+                  freq: Optional[str] = None
+                  ) -> Union[pd.DataFrame, pd.Series]:
+        """Return realized costs in raw currency or NAV-normalized units.
+
+        Args:
+            is_agg: Aggregate costs across instruments when true.
+            is_grouped: Aggregate instruments using the portfolio's group metadata.
+            time_period: Optional date interval applied after aggregation.
+            add_total: Add a portfolio-total column to non-aggregate results.
+            is_unit_based_traded_volume: Normalize currency costs by NAV when true. Normalized
+                costs require identical unique NAV and cost row labels and align NAV by label.
+            roll_period: Optional trailing observation count used to sum costs.
+            freq: Optional resampling frequency applied before the rolling sum.
+
+        Returns:
+            Cost series or frame retaining the report row labels.
+
+        Raises:
+            ValueError: If normalized costs and NAV do not have identical unique row labels.
+        """
+
+        if is_unit_based_traded_volume is None:
+            is_unit_based_traded_volume = True
+        costs = self.realized_costs
+        if is_unit_based_traded_volume:
+            nav = self._get_nav_for_report_index(costs.index, "cost")
+            costs = costs.divide(nav, axis=0)
+        if is_agg:
+            costs = pd.Series(np.nansum(costs, axis=1), index=costs.index, name=self.nav.name)
+        elif is_grouped:  # agg by groups
+            costs = dfg.agg_df_by_groups_ax1(costs,
+                                             group_data=self.group_data,
+                                             agg_func=np.nansum,
+                                             total_column=str(self.nav.name) if add_total else None,
+                                             group_order=self.group_order)
+        else:
+            if add_total:
+                costs = pd.concat([costs.sum(axis=1).rename(self.nav.name), costs],
+                                  axis=1, sort=True)
+
+        if freq is not None:  # first aggregate by freq
+            costs = costs.resample(freq).sum()
+        if roll_period is not None:  # now aggregate by roll period
+            costs = costs.rolling(roll_period).sum()
+        if time_period is not None:
+            costs = time_period.locate(costs)
+        return costs
+
+    def compute_volume_participation(self,
+                                     volumes: pd.DataFrame,
+                                     trade_level: float = 100000000
+                                     ) -> pd.DataFrame:
+        turnover = self.get_turnover(is_agg=False, is_grouped=False)
+        participation = trade_level * turnover.divide(volumes)
+        return participation
+
+    def compute_cumulative_attribution(self) -> pd.DataFrame:
+        attribution = (self.prices.pct_change()).multiply(self.weights.shift(1))
+        attribution = attribution.cumsum(axis=0)
+        return attribution
+
+    def compute_realized_pnl(self, time_period: TimePeriod = None) -> Tuple[pd.DataFrame, ...]:
+        avg_costs, realized_pnl, mtm_pnl, trades = compute_realized_pnl(prices=self.prices.to_numpy(),
+                                                                        units=self.units.to_numpy())
+        avg_costs = pd.DataFrame(avg_costs, index=self.prices.index, columns=self.prices.columns)
+        realized_pnl = pd.DataFrame(realized_pnl, index=self.prices.index, columns=self.prices.columns)
+        mtm_pnl = pd.DataFrame(mtm_pnl, index=self.prices.index, columns=self.prices.columns)
+        trades = pd.DataFrame(trades, index=self.prices.index, columns=self.prices.columns)
+        if time_period is not None:
+            avg_costs = time_period.locate(avg_costs)
+            realized_pnl = time_period.locate(realized_pnl)
+            mtm_pnl = time_period.locate(mtm_pnl)
+            trades = time_period.locate(trades)
+        realized_pnl = realized_pnl.cumsum(axis=0)
+        total_pnl = realized_pnl.add(mtm_pnl)
+        return avg_costs, realized_pnl, mtm_pnl, total_pnl, trades
+
+    def compute_portfolio_benchmark_betas(self,
+                                          benchmark_prices: pd.DataFrame,
+                                          time_period: TimePeriod = None,
+                                          freq_beta: str = None,
+                                          factor_beta_span: int = 65  # quarter
+                                          ) -> pd.DataFrame:
+        """
+        compute benchmark betas of instruments
+        portfolio_beta_i = sum(instrument_beta_i*exposure)
+        """
+        instrument_prices = self.prices
+        benchmark_prices = benchmark_prices.reindex(index=instrument_prices.index, method='ffill')
+        exposures = self.get_weights().reindex(index=instrument_prices.index, method='ffill')
+        benchmark_betas = ef.compute_portfolio_ewm_benchmark_betas(instrument_prices=instrument_prices,
+                                                                   weights=exposures,
+                                                                   benchmark_prices=benchmark_prices,
+                                                                   time_period=time_period,
+                                                                   freq_beta=freq_beta,
+                                                                   factor_beta_span=factor_beta_span)
+        return benchmark_betas
+
+    def compute_portfolio_benchmark_attribution(self,
+                                                benchmark_prices: pd.DataFrame,
+                                                time_period: TimePeriod = None,
+                                                freq_beta: str = 'B',
+                                                factor_beta_span: int = 63,  # quarter
+                                                residual_name: str = 'Alpha'
+                                                ) -> pd.DataFrame:
+        """
+        attribution = portfolio_return_{t} - benchmark_return_{t}*bet_{t-1}
+        returns are compounded
+        """
+        instrument_prices = self.prices
+        benchmark_prices = benchmark_prices.reindex(index=instrument_prices.index, method='ffill')
+        weights = self.get_weights().reindex(index=instrument_prices.index, method='ffill')
+        portfolio_nav = self.get_portfolio_nav().reindex(index=instrument_prices.index, method='ffill')
+        joint_attrib = ef.compute_portfolio_benchmark_ewm_beta_alpha_attribution(instrument_prices=instrument_prices,
+                                                                                 weights=weights,
+                                                                                 benchmark_prices=benchmark_prices,
+                                                                                 portfolio_nav=portfolio_nav,
+                                                                                 time_period=time_period,
+                                                                                 freq_beta=freq_beta,
+                                                                                 factor_beta_span=factor_beta_span,
+                                                                                 residual_name=residual_name)
+        return joint_attrib
+
+    """
+    ### instrument level getters
+    """
+
+    def get_instruments_returns(self,
+                                time_period: TimePeriod = None
+                                ) -> pd.DataFrame:
+        returns = self.prices.pct_change(fill_method=None)
+        if time_period is not None:
+            returns = time_period.locate(returns)
+        return returns
+
+    def get_instruments_periodic_returns(self,
+                                         time_period: TimePeriod = None,
+                                         freq: str = 'ME'
+                                         ) -> pd.DataFrame:
+        returns = self.get_instruments_returns(time_period=time_period)
+        prices = ret.returns_to_nav(returns=returns, init_period=None)
+        returns_f = ret.to_returns(prices=prices, freq=freq)
+        return returns_f
+
+    def get_instruments_performance_attribution(self,
+                                                time_period: TimePeriod = None,
+                                                constant_trade_level: bool = False
+                                                ) -> pd.Series:
+        navs = self.get_instruments_navs(time_period=time_period, constant_trade_level=constant_trade_level)
+        perf = ret.to_total_returns(prices=navs).rename(self.nav.name)
+        if self.tickers_to_names_map is not None:
+            perf = perf.rename(index=self.tickers_to_names_map)
+        return perf
+
+    def get_instruments_pnl_risk_attribution(self,
+                                             time_period: TimePeriod = None
+                                             ) -> pd.Series:
+        pnl = self.get_instruments_pnl(time_period=time_period)
+        # portfolio_pnl = pnl.sum(axis=1)
+
+        pnl_values = pnl.replace({0.0: np.nan}).to_numpy()
+        # np.nanstd warns on an all-NaN instrument; NaN is the intended risk for that column.
+        pnl_risk = np.array([np.nan if np.isnan(values).all() else np.nanstd(values)
+                             for values in pnl_values.T])
+        # portfolio_pnl_risk = np.nanstd(portfolio_pnl.replace({0.0: np.nan}), axis=0)
+        # pnl_risk_ratio = pnl_risk / portfolio_pnl_risk
+        pnl_risk_ratio = pnl_risk / np.nansum(pnl_risk)
+
+        data = pd.Series(pnl_risk_ratio, index=pnl.columns, name=self.nav.name)
+        if self.tickers_to_names_map is not None:
+            data = data.rename(index=self.tickers_to_names_map)
+        return data
+
+    def get_performance_attribution_data(self,
+                                         attribution_metric: AttributionMetric = AttributionMetric.PNL,
+                                         time_period: TimePeriod = None,
+                                         turnover_computation_type: Optional[
+                                             TurnoverComputationType
+                                         ] = None,
+                                         is_unit_based_traded_volume: Optional[bool] = None,
+                                         vols: Optional[pd.DataFrame] = None,
+                                         **kwargs
+                                         ) -> Union[pd.DataFrame, pd.Series]:
+        if attribution_metric == AttributionMetric.PNL:
+            data = self.get_instruments_performance_attribution(time_period=time_period)
+        elif attribution_metric == AttributionMetric.PNL_RISK:
+            data = self.get_instruments_pnl_risk_attribution(time_period=time_period)
+        elif attribution_metric == AttributionMetric.INST_PNL:
+            data = self.get_instruments_navs(time_period=time_period)
+        elif attribution_metric == AttributionMetric.COSTS:
+            is_unit_based_costs = (
+                True
+                if is_unit_based_traded_volume is None
+                else is_unit_based_traded_volume
+            )
+            data = self.get_costs(is_agg=False, is_grouped=False, roll_period=None,
+                                  is_unit_based_traded_volume=is_unit_based_costs,
+                                  add_total=False,
+                                  time_period=time_period)
+            data = data.sum(axis=0)
+            # print(f"total costs, is_unit_based_traded_volume={is_unit_based_traded_volume} = {np.nansum(data)}")
+        elif attribution_metric == AttributionMetric.TURNOVER:
+            data = self.get_turnover(is_agg=False, is_grouped=False, roll_period=None,
+                                     add_total=False,
+                                     turnover_computation_type=turnover_computation_type,
+                                     is_unit_based_traded_volume=is_unit_based_traded_volume,
+                                     vols=vols,
+                                     time_period=time_period)
+            an = infer_annualisation_factor_from_df(data=data)
+            data = an * data.mean(axis=0)
+            # print(f"total turnover = {np.nansum(data)}")
+        elif attribution_metric == AttributionMetric.VOL_ADJUSTED_TURNOVER:
+            if vols is None:
+                if not isinstance(self.input_weights, pd.DataFrame):
+                    raise TypeError(
+                        "input_weights must be a pandas DataFrame for volatility-normalized "
+                        "weight turnover"
+                    )
+                vols = compute_ewm_vol(
+                    data=qis.to_returns(self.prices, is_log_returns=True),
+                    span=33,
+                    annualize=True,
+                ).reindex(
+                    index=self.input_weights.index,
+                    columns=self.input_weights.columns,
+                )
+            data = self.get_turnover(is_agg=False, is_grouped=False, roll_period=None,
+                                     add_total=False,
+                                     turnover_computation_type=(
+                                         TurnoverComputationType.VOLATILITY_NORMALIZED_WEIGHTS
+                                     ),
+                                     vols=vols,
+                                     time_period=time_period)
+            an = infer_annualisation_factor_from_df(data=data)
+            data = an * data.mean(axis=0)
+
+        else:
+            raise NotImplementedError(f"{attribution_metric}")
+
+        return data
+
+    def get_num_investable_instruments(self, time_period: TimePeriod = None) -> pd.DataFrame:
+        num_available_prices = np.sum(np.where(np.isfinite(self.prices), 1.0, 0.0), axis=1)
+        num_available_prices = pd.Series(num_available_prices, index=self.weights.index, name='Investable')
+        non_zero_exposures = self.weights.where(np.isclose(self.weights, 0.0) == False, other=np.nan)
+        num_invested_instruments = np.sum(np.where(np.isfinite(non_zero_exposures), 1.0, 0.0), axis=1)
+        num_invested_instruments = pd.Series(num_invested_instruments, index=self.weights.index, name='Invested')
+        df = pd.concat([num_available_prices, num_invested_instruments], axis=1, sort=True)
+        if time_period is not None:
+            df = time_period.locate(df)
+        return df
+
+    def get_instruments_performance_table(self,
+                                          time_period: TimePeriod = None,
+                                          portfolio_name: str = 'Attribution'
+                                          ) -> pd.DataFrame:
+        """
+        using avg weight
+        """
+        insts_returns = self.get_instruments_returns(time_period=time_period)
+        insts_return = ret.to_total_returns(prices=ret.returns_to_nav(returns=insts_returns))
+        weight = self.weights
+        if time_period is not None:
+            weight = time_period.locate(weight)
+        weight = weight.mean(axis=0)
+        portf_return = insts_return.multiply(weight).replace({0.0: np.nan}).dropna()
+        data = pd.concat([weight.rename('Weight'),
+                          insts_return.rename('Asset'),
+                          portf_return.rename(portfolio_name)],
+                         axis=1, sort=True).dropna()
+        data = data.sort_values('Weight', ascending=False)
+        if self.tickers_to_names_map is not None:
+            data = data.rename(index=self.tickers_to_names_map)
+
+        return data
+
+    def get_brinson_inputs(
+            self, time_period: Optional[TimePeriod] = None,
+            freq: Optional[str] = 'ME', is_net: bool = False,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Return instrument contributions and prior holdings for Brinson attribution.
+
+        Start from the full stored arithmetic instrument P&L before slicing, so the first
+        requested return retains its preceding NAV/holding observation. With is_net=True,
+        deduct each realised trading cost divided by the preceding NAV, exactly once.
+        Management fees and cash funding are not instrument trading costs and are not added.
+        Coarser-period contributions compound using within-period portfolio wealth;
+        prior weights are averaged within the period. Those averages are effective
+        exposures, not weights held constant throughout a month. For exact allocation
+        effects across intra-period trades, use native inputs (freq=None), compute
+        Brinson and only then aggregate its linked effect increments. Contributions
+        reconcile to NAV returns when fees/funding are zero and is_net=True.
+
+        Args:
+            time_period: Return dates to include, excluding the NAV baseline.
+            freq: Optional aggregation frequency; None keeps the native observations.
+            is_net: Include realised trading-cost drag by instrument.
+
+        Returns:
+            Arithmetic instrument return contributions and their applied weight panel.
+        """
+        # get_instruments_pnl(is_net=True) uses rolling current-NAV costs; Brinson needs
+        # individual realised costs on the same preceding-NAV basis as arithmetic returns.
+        pnl = self.get_instruments_pnl(is_net=False)
+        weights = self.weights.shift(1)
+        if is_net:
+            previous_nav = self.nav.shift(1)
+            costs = self.get_costs(
+                add_total=False, is_unit_based_traded_volume=False, roll_period=None)
+            pnl = pnl - costs.div(previous_nav, axis=0)
+        # The initial NAV is a baseline, not a realised return; never manufacture its weight.
+        pnl = pnl.iloc[1:]
+        weights = weights.reindex(pnl.index)
+        if time_period is not None:
+            pnl = time_period.locate(pnl)
+            weights = time_period.locate(weights)
+        if freq is not None:
+            # Chain contributions on beginning-of-native-period wealth within each bin.
+            growth = (1.0 + pnl.sum(axis=1)).groupby(pd.Grouper(freq=freq)).cumprod()
+            prior = growth.groupby(pd.Grouper(freq=freq)).shift(1).fillna(1.0)
+            pnl = pnl.mul(prior, axis=0).resample(freq).sum(min_count=1)
+            weights = weights.resample(freq).mean()
+        return pnl, weights
+
+    def _get_attribution_table_by_instrument_canonical(self,
+                                                       time_period: TimePeriod = None,
+                                                       freq: str = 'ME',
+                                                       is_input_weights: bool = False
+                                                       ) -> pd.DataFrame:
+        """Return instrument attribution keyed by canonical portfolio tickers."""
+        if is_input_weights:
+            weights = self.input_weights
+            if not isinstance(weights, pd.DataFrame):
+                raise ValueError("input weights must be pd.Dataframe for is_input_weights=True")
+            prices_w = self.prices.reindex(index=weights.index, method='ffill')
+            returns_f = prices_w.pct_change()
+            portf_return = returns_f.multiply(weights.shift(1)).iloc[1:, :]
+        else:
+            returns_f = self.get_instruments_periodic_returns(time_period=time_period, freq=freq)
+            weight = self.weights.reindex(index=returns_f.index, method='ffill')
+            # first row is None
+            portf_return = returns_f.multiply(weight.shift(1)).iloc[1:, :]
+        return portf_return
+
+    def get_attribution_table_by_instrument(self,
+                                            time_period: TimePeriod = None,
+                                            freq: str = 'ME',
+                                            is_input_weights: bool = False
+                                            ) -> pd.DataFrame:
+        """
+        using avg weight
+        """
+        portf_return = self._get_attribution_table_by_instrument_canonical(
+            time_period=time_period,
+            freq=freq,
+            is_input_weights=is_input_weights,
+        )
+        if self.tickers_to_names_map is not None:
+            portf_return = portf_return.rename(columns=self.tickers_to_names_map)
+        return portf_return
+
+    def compute_portfolio_vol(self,
+                              time_period: TimePeriod = None,
+                              freq: str = 'W-WED',
+                              span: int = 13  # 3m span of weekly returns
+                              ) -> pd.DataFrame:
+        """
+        compute_portfolio_vol using 1) instrument weights and covar matrix 2) realised returns vol
+        """
+        returns_f = self.get_instruments_periodic_returns(freq=freq)
+        weights = self.weights.reindex(index=returns_f.index, method='ffill')
+        portfolio_vol = compute_portfolio_vol(returns=returns_f,
+                                              weights=weights,
+                                              span=span,
+                                              annualize=True)
+        strategy_vol = compute_ewm_vol(data=qis.to_returns(self.get_portfolio_nav(freq=freq), is_log_returns=True),
+                                       span=span,
+                                       annualize=True)
+        df = pd.concat([portfolio_vol.rename('instrument weighted vol'),
+                        strategy_vol.rename('strategy returns vol')
+                        ], axis=1, sort=True)
+        if time_period is not None:
+            df = time_period.locate(df)
+        return df
+
+    def compute_distribution_yield(self,
+                                   paid_dividends: pd.DataFrame,
+                                   div_rolling_freq: str = 'ME',
+                                   div_rolling_period: int = 12,
+                                   time_period: TimePeriod = None
+                                   ) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
+        positions = self.units
+        distributions_by_instrument = paid_dividends.multiply(positions)
+        nav = self.get_portfolio_nav().reindex(index=distributions_by_instrument.index, method='ffill')
+        distributions_by_instrument_yield = distributions_by_instrument.divide(nav, axis=0)
+        # resample at 'ME' and compute rolling sum
+        distributions_by_instrument_yield_freq = distributions_by_instrument_yield.resample(div_rolling_freq).sum()
+        distributions_by_instrument_yield_rolling = distributions_by_instrument_yield_freq.fillna(0.0).rolling(
+            div_rolling_period).sum()
+        # find total distributions
+        distribution_yield = distributions_by_instrument_yield_freq.sum(axis=1)
+        distribution_yield_rolling = distributions_by_instrument_yield_rolling.sum(axis=1)
+        if time_period is not None:
+            distributions_by_instrument_yield_rolling = time_period.locate(distributions_by_instrument_yield_rolling)
+            distribution_yield = time_period.locate(distribution_yield)
+            distribution_yield_rolling = time_period.locate(distribution_yield_rolling)
+        return distributions_by_instrument_yield_rolling, distribution_yield, distribution_yield_rolling
+
+    def compute_portfolio_vars(self,
+                               is_correlated: bool = True,
+                               time_period: TimePeriod = None,
+                               freq: str = 'B',
+                               total_column: Optional[str] = 'Total',
+                               vol_span: Union[int, float] = 33,  # span in number of freq-returns
+                               group_data: pd.Series = None,
+                               group_order: List[str] = None
+                               ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+        if group_data is None:
+            group_data = self.group_data
+        if group_order is None:
+            group_order = self.group_order
+        if is_correlated:
+            portfolio_vars = qis.compute_portfolio_correlated_var_by_groups(prices=self.prices,
+                                                                            weights=self.get_weights(freq=freq),
+                                                                            group_data=group_data,
+                                                                            group_order=group_order,
+                                                                            freq=freq,
+                                                                            vol_span=vol_span,
+                                                                            # span in number of freq-returns
+                                                                            total_column=total_column,
+                                                                            time_period=time_period)
+            instrument_vars = None
+        else:
+            instrument_vars, portfolio_vars = qis.compute_portfolio_independent_var_by_ac(prices=self.prices,
+                                                                                          weights=self.get_weights(freq=freq),
+                                                                                          group_data=group_data,
+                                                                                          group_order=group_order,
+                                                                                          freq=freq,
+                                                                                          vol_span=vol_span,
+                                                                                          # span in number of freq-returns
+                                                                                          total_column=total_column,
+                                                                                          time_period=time_period)
+        return portfolio_vars, instrument_vars
+
+    def compute_ex_anti_portfolio_vol_implied_by_covar(self,
+                                                       covar_dict: Dict[pd.Timestamp, pd.DataFrame] = None,
+                                                       freq: Optional[str] = None
+                                                       ) -> pd.Series:
+        """
+        compute portfolio ex-anti portfolio vol using covar_dict
+        """
+        if covar_dict is None:
+            if self.covar_dict is None:
+                raise ValueError(f"must provide covar_dict")
+            else:
+                covar_dict = self.covar_dict
+        is_input_weights = True if freq is None else False
+        strategy_weights = self.get_weights(freq=freq, is_input_weights=is_input_weights)
+        covar_index = list(covar_dict.keys())
+        portfolio_vol = {}
+        if freq is None:  # align with covar
+            strategy_weights = strategy_weights.reindex(index=covar_index).ffill().fillna(0.0)
+            for date, pd_covar in covar_dict.items():
+                # align with covar matrix
+                w = strategy_weights.loc[date].reindex(index=pd_covar.columns).fillna(0.0)
+                portfolio_vol[date] = np.sqrt(w.T @ pd_covar @ w)
+        else:
+            for date, weights in strategy_weights.to_dict(orient='index').items():
+                last_covar_update_date = qis.find_upto_date_from_datetime_index(index=covar_index, date=date)
+                if last_covar_update_date is not None:
+                    pd_covar = covar_dict[last_covar_update_date]
+                    w = pd.Series(weights).reindex(index=pd_covar.columns).fillna(0.0)
+                    portfolio_vol[date] = np.sqrt(w.T @ pd_covar @ w)
+        portfolio_vol = pd.Series(portfolio_vol, name=self.ticker)
+        return portfolio_vol
+
+    def compute_risk_contributions_implied_by_covar(self,
+                                                    covar_dict: Dict[pd.Timestamp, pd.DataFrame] = None,
+                                                    group_data: pd.Series = None,
+                                                    group_order: List[str] = None,
+                                                    freq: Optional[str] = None,
+                                                    normalise: bool = False,
+                                                    time_period: TimePeriod = None
+                                                    ) -> pd.DataFrame:
+        """
+        compute risk contributions using covar_dict
+        """
+        if covar_dict is None:
+            if self.covar_dict is None:
+                raise ValueError(f"must provide covar_dict")
+            else:
+                covar_dict = self.covar_dict
+        is_input_weights = True if freq is None else False
+        strategy_weights = self.get_weights(freq=freq, is_input_weights=is_input_weights, time_period=time_period)
+        covar_index = list(covar_dict.keys())
+        strategy_rc = {}
+        if freq is None:  # align with covar dates
+            strategy_weights = strategy_weights.reindex(index=covar_index).ffill().fillna(0.0)
+            for date, pd_covar in covar_dict.items():
+                strategy_rc[date] = compute_portfolio_risk_contributions(w=strategy_weights.loc[date], covar=pd_covar)
+        else:
+            for date, weights in strategy_weights.to_dict(orient='index').items():
+                if date > covar_index[0]:
+                    last_covar_update_date = qis.find_upto_date_from_datetime_index(index=covar_index, date=date)
+                    if last_covar_update_date is not None:
+                        strategy_rc[date] = compute_portfolio_risk_contributions(w=pd.Series(weights).fillna(0.0),
+                                                                             covar=covar_dict[last_covar_update_date])
+
+        strategy_rc = pd.DataFrame.from_dict(strategy_rc, orient='index')
+        if group_data is not None:
+            strategy_rc = dfg.agg_df_by_groups_ax1(strategy_rc, group_data=group_data, group_order=group_order)
+        if normalise:
+            strategy_rc = qis.df_to_weight_allocation_sum1(strategy_rc)
+        return strategy_rc
+
+    # """
+    # plotting methods
+    # """
+
+    def add_regime_shadows(self,
+                           ax: plt.Subplot,
+                           regime_benchmark: str,
+                           index: pd.Index = None,
+                           regime_classifier: BenchmarkReturnsQuantilesRegime = regime_classifier
+                           ) -> None:
+        """
+        add regime shadows using regime_benchmark
+        """
+        if self.benchmark_prices is None:
+            raise ValueError(f"set benchmarks data")
+        pivot_prices = self.benchmark_prices[regime_benchmark]
+        if index is not None:
+            pivot_prices = pivot_prices.reindex(index=index, method='ffill')
+        qis.add_bnb_regime_shadows(ax=ax, pivot_prices=pivot_prices, regime_classifier=regime_classifier)
+
+    def plot_nav(self,
+                 regime_benchmark: str = None,
+                 time_period: TimePeriod = None,
+                 add_benchmarks: bool = False,
+                 regime_classifier: BenchmarkReturnsQuantilesRegime = regime_classifier,
+                 ax: plt.Subplot = None,
+                 **kwargs
+                 ) -> None:
+        if add_benchmarks:
+            prices = self.get_portfolio_nav_with_benchmark_prices(time_period=time_period)
+        else:
+            prices = self.get_portfolio_nav(time_period=time_period)
+        if ax is None:
+            with sns.axes_style('darkgrid'):
+                fig, ax = plt.subplots(1, 1, figsize=(16, 12), tight_layout=True)
+        ppd.plot_prices(prices=prices, ax=ax, **kwargs)
+
+        if regime_benchmark is not None:
+            self.add_regime_shadows(ax=ax, regime_benchmark=regime_benchmark, index=prices.index,
+                                    regime_classifier=regime_classifier)
+
+    def plot_group_nav(self,
+                       regime_benchmark: str = None,
+                       time_period: TimePeriod = None,
+                       add_benchmarks: bool = False,
+                       regime_classifier: BenchmarkReturnsQuantilesRegime = regime_classifier,
+                       ax: plt.Subplot = None,
+                       **kwargs
+                       ) -> None:
+
+        total_group_navs = self.get_total_nav_with_group_navs(time_period=time_period)
+        if add_benchmarks and self.benchmark_prices is not None:
+            benchmark_prices = self.benchmark_prices.reindex(index=total_group_navs.index, method='ffill')
+            total_group_navs = pd.concat([total_group_navs, benchmark_prices], axis=1, sort=True)
+        if ax is None:
+            with sns.axes_style('darkgrid'):
+                fig, ax = plt.subplots(1, 1, figsize=(16, 12), tight_layout=True)
+        ppd.plot_prices(prices=total_group_navs, ax=ax, **kwargs)
+
+        if regime_benchmark is not None:
+            self.add_regime_shadows(ax=ax, regime_benchmark=regime_benchmark, index=total_group_navs.index,
+                                    regime_classifier=regime_classifier)
+
+    def plot_portfolio_vols(self,
+                            time_period: TimePeriod = None,
+                            freq: str = 'W-WED',
+                            span: int = 13,  # 3m span of weekly returns
+                            regime_benchmark: str = None,
+                            regime_classifier: BenchmarkReturnsQuantilesRegime = regime_classifier,
+                            ax: plt.Subplot = None,
+                            **kwargs
+                            ) -> plt.Figure:
+        if ax is None:
+            fig, ax = plt.subplots()
+
+        portfolio_vols = self.compute_portfolio_vol(time_period=time_period, freq=freq, span=span)
+        fig = qis.plot_time_series(df=portfolio_vols,
+                                   var_format='{:,.2%}',
+                                   legend_stats=qis.LegendStats.AVG_NONNAN_LAST,
+                                   title=f"Portfolio EWM {span}-span vols of {freq}-freq returns",
+                                   ax=ax,
+                                   **kwargs)
+        if regime_benchmark is not None:
+            self.add_regime_shadows(ax=ax, regime_benchmark=regime_benchmark, index=portfolio_vols.index,
+                                    regime_classifier=regime_classifier)
+        return fig
+
+    def plot_rolling_perf(self,
+                          rolling_perf_stat: RollingPerfStat = RollingPerfStat.SHARPE,
+                          add_benchmarks: bool = False,
+                          regime_benchmark: str = None,
+                          time_period: TimePeriod = None,
+                          rolling_window: int = 1300,
+                          roll_freq: Optional[str] = None,
+                          legend_stats: pts.LegendStats = pts.LegendStats.AVG_LAST,
+                          title: Optional[str] = None,
+                          regime_classifier: BenchmarkReturnsQuantilesRegime = regime_classifier,
+                          ax: plt.Subplot = None,
+                          **kwargs
+                          ) -> plt.Figure:
+
+        # do not use start end dates here so the sharpe will be continuous with different time_period
+        if add_benchmarks:
+            prices = self.get_portfolio_nav_with_benchmark_prices(time_period=time_period)
+        else:
+            prices = self.get_portfolio_nav(time_period=time_period)
+        if ax is None:
+            fig, ax = plt.subplots()
+        fig = ppd.plot_rolling_perf_stat(prices=prices,
+                                         rolling_perf_stat=rolling_perf_stat,
+                                         time_period=time_period,
+                                         roll_periods=rolling_window,
+                                         roll_freq=roll_freq,
+                                         legend_stats=legend_stats,
+                                         title=title,
+                                         ax=ax,
+                                         **kwargs)
+        if regime_benchmark is not None:
+            self.add_regime_shadows(ax=ax, regime_benchmark=regime_benchmark, index=prices.index,
+                                    regime_classifier=regime_classifier)
+        return fig
+
+    def compute_ra_perf_table(self,
+                              time_period: TimePeriod = None,
+                              perf_params: PerfParams = None,
+                              perf_columns: List[PerfStat] = rpt.BENCHMARK_TABLE_COLUMNS,
+                              **kwargs
+                              ) -> pd.DataFrame:
+        prices = self.get_portfolio_nav(time_period=time_period).to_frame()
+        ra_perf_table = ppt.get_ra_perf_columns(prices=prices,
+                                                perf_params=perf_params,
+                                                perf_columns=perf_columns,
+                                                **kwargs)
+        return ra_perf_table
+
+    def plot_ra_perf_table(self,
+                           benchmark_price: Union[pd.Series, pd.DataFrame] = None,
+                           benchmark: str = None,
+                           is_grouped: bool = True,
+                           time_period: TimePeriod = None,
+                           perf_params: PerfParams = None,
+                           perf_columns: List[PerfStat] = rpt.BENCHMARK_TABLE_COLUMNS,
+                           title: str = None,
+                           ax: plt.Subplot = None,
+                           **kwargs
+                           ) -> None:
+        if is_grouped:
+            total_nav = self.get_portfolio_nav(time_period=time_period)
+            group_navs = self.get_group_navs(time_period=time_period, is_add_group_total=False)
+            prices = pd.concat([total_nav, group_navs], axis=1, sort=True)
+            for_title = 'with portfolio groups'
+            rows_edge_lines = [len(prices.columns)]
+        else:
+            prices = self.get_portfolio_nav(time_period=time_period).to_frame()
+            for_title = ''
+            rows_edge_lines = None
+        if benchmark_price is not None:
+            if isinstance(benchmark_price, pd.DataFrame):  # bechmark is the last asset
+                if benchmark is None:
+                    benchmark = benchmark_price.columns[-1]
+            else:
+                benchmark = benchmark_price.name
+            if benchmark not in prices.columns:
+                prices = pd.concat([prices,
+                                    benchmark_price.reindex(index=prices.index, method='ffill')],
+                                   axis=1, sort=True)
+            prices = prices.loc[:, ~prices.columns.duplicated(keep='first')]
+            title = title or f"RA performance table {for_title} for {perf_params.freq_vol}-freq returns with beta to {benchmark}:" \
+                             f" {qis.get_time_period(prices).to_str()}"
+            ppt.plot_ra_perf_table_benchmark(prices=prices,
+                                             benchmark=benchmark,
+                                             perf_params=perf_params,
+                                             perf_columns=perf_columns,
+                                             title=title,
+                                             rotation_for_columns_headers=0,
+                                             special_rows_colors=[(1, 'deepskyblue'),
+                                                                  (len(prices.columns), 'lightskyblue')],
+                                             rows_edge_lines=rows_edge_lines,
+                                             column_header='Portfolio',
+                                             ax=ax,
+                                             **kwargs)
+        else:
+            title = title or f"RA performance table {for_title}: {qis.get_time_period(prices).to_str()}"
+            ppt.plot_ra_perf_table(prices=prices,
+                                   perf_params=perf_params,
+                                   perf_columns=rpt.COMPACT_TABLE_COLUMNS,
+                                   title=title,
+                                   rotation_for_columns_headers=0,
+                                   column_header='Portfolio',
+                                   ax=ax,
+                                   **kwargs)
+
+    def plot_returns_scatter(self,
+                             benchmark_price: pd.Series,
+                             is_grouped: bool = True,
+                             time_period: TimePeriod = None,
+                             title: str = None,
+                             freq: str = 'QE',
+                             ax: plt.Subplot = None,
+                             **kwargs
+                             ) -> None:
+        if is_grouped:
+            prices = self.get_total_nav_with_group_navs(time_period=time_period)
+            title = title or f"Scatterplot of {freq}-freq returns by groups vs {str(benchmark_price.name)}"
+        else:
+            prices = self.get_portfolio_nav(time_period=time_period)
+            title = title or f"Scatterplot of {freq}-freq returns vs {str(benchmark_price.name)}"
+        prices = pd.concat([prices, benchmark_price.reindex(index=prices.index, method='ffill')],
+                           axis=1, sort=True)
+        if np.any(prices.columns.duplicated()):
+            raise ValueError(f"duplicated columns {prices.columns}")
+        local_kwargs = qis.update_kwargs(kwargs=kwargs,
+                                         new_kwargs={'weight': 'bold',
+                                                     'x_rotation': 0,
+                                                     'first_color_fixed': False,
+                                                     'ci': None,
+                                                     'markersize': 6})
+        prs.plot_returns_scatter(prices=prices,
+                                 benchmark=str(benchmark_price.name),
+                                 freq=freq,
+                                 order=2,
+                                 title=title,
+                                 ax=ax,
+                                 **local_kwargs)
+
+    def plot_monthly_returns_heatmap(self,
+                                     time_period: TimePeriod = None,
+                                     ax: plt.Subplot = None,
+                                     **kwargs
+                                     ) -> None:
+        # for monthly returns fix A and date_format
+        kwargs = qis.update_kwargs(kwargs, dict(heatmap_freq='YE', date_format='%Y'))
+        rhe.plot_returns_heatmap(prices=self.get_portfolio_nav(time_period=time_period),
+                                 heatmap_column_freq='ME',
+                                 is_add_annual_column=True,
+                                 is_inverse_order=True,
+                                 ax=ax,
+                                 **kwargs)
+
+    def plot_periodic_returns(self,
+                              benchmark_prices: Union[pd.DataFrame, pd.Series] = None,
+                              is_grouped: bool = True,
+                              time_period: TimePeriod = None,
+                              heatmap_freq: str = 'YE',
+                              date_format: str = '%Y',
+                              transpose: bool = True,
+                              title: str = None,
+                              ax: plt.Subplot = None,
+                              **kwargs
+                              ) -> None:
+        if is_grouped:
+            prices = self.get_total_nav_with_group_navs(time_period=time_period)
+            title = title or f"{heatmap_freq}-returns by groups"
+        else:
+            prices = self.get_portfolio_nav(time_period=time_period).to_frame()
+            title = title or f"{heatmap_freq}-returns"
+        if benchmark_prices is not None:
+            hline_rows = [1, len(prices.columns)]
+            prices = pd.concat([prices,
+                                benchmark_prices.reindex(index=prices.index, method='ffill')],
+                               axis=1, sort=True)
+        else:
+            hline_rows = None
+
+        rhe.plot_periodic_returns_table(prices=prices,
+                                        ax=ax,
+                                        title=title,
+                                        date_format=date_format,
+                                        transpose=transpose,
+                                        hline_rows=hline_rows,
+                                        **qis.update_kwargs(kwargs, dict(freq=heatmap_freq)))
+
+    def plot_regime_data(self,
+                         benchmark_price: pd.Series,
+                         is_grouped: bool = True,
+                         regime_data_to_plot: RegimeData = RegimeData.REGIME_SHARPE,
+                         time_period: TimePeriod = None,
+                         var_format: Optional[str] = None,
+                         is_conditional_sharpe: bool = True,
+                         legend_loc: Optional[str] = 'upper center',
+                         title: str = None,
+                         perf_params: PerfParams = None,
+                         regime_classifier: BenchmarkReturnsQuantilesRegime = BenchmarkReturnsQuantilesRegime(),
+                         ax: plt.Subplot = None,
+                         **kwargs
+                         ) -> plt.Figure:
+
+        if is_grouped:
+            prices = self.get_total_nav_with_group_navs(time_period=time_period)
+            title = title or (f"Sharpe ratio attribution by groups to {str(benchmark_price.name)} "
+                              f"Bear/Normal/Bull regimes of {regime_classifier.freq} returns")
+        else:
+            prices = self.get_portfolio_nav(time_period=time_period).to_frame()
+            title = title or (f"Sharpe ratio attribution to {str(benchmark_price.name)} Bear/Normal/Bull regimes "
+                              f"of {regime_classifier.freq} returns")
+
+        if benchmark_price.name not in prices.columns:
+            prices = pd.concat([benchmark_price.reindex(index=prices.index, method='ffill'),
+                                prices],
+                               axis=1, sort=True)
+
+        fig = qis.plot_regime_data(regime_classifier=regime_classifier,
+                                   prices=prices,
+                                   benchmark=str(benchmark_price.name),
+                                   is_conditional_sharpe=is_conditional_sharpe,
+                                   regime_data_to_plot=regime_data_to_plot,
+                                   var_format=var_format or '{:.2f}',
+                                   legend_loc=legend_loc,
+                                   perf_params=perf_params,
+                                   title=title,
+                                   ax=ax,
+                                   **kwargs)
+        return fig
+
+    def plot_vol_regimes(self,
+                         benchmark_price: pd.Series,
+                         is_grouped: bool = True,
+                         time_period: TimePeriod = None,
+                         title: str = None,
+                         freq: str = 'ME',
+                         ax: plt.Subplot = None,
+                         **kwargs
+                         ) -> plt.Figure:
+
+        if is_grouped:
+            prices = self.get_total_nav_with_group_navs(time_period=time_period)
+            title = title or f"{freq}-returns by groups conditional on vols {str(benchmark_price.name)}"
+        else:
+            prices = self.get_portfolio_nav(time_period=time_period)
+            title = title or f"{freq}-returns conditional on vols {str(benchmark_price.name)}"
+        prices = pd.concat([benchmark_price.reindex(index=prices.index, method='ffill'), prices],
+                           axis=1, sort=True)
+
+        fig = qis.plot_regime_boxplot(prices=prices,
+                                      benchmark=str(benchmark_price.name),
+                                      title=title,
+                                      ax=ax,
+                                      **kwargs)
+        return fig
+
+    def plot_contributors(self,
+                          time_period: TimePeriod = None,
+                          num_assets: int = 10,
+                          ax: plt.Subplot = None,
+                          **kwargs
+                          ) -> None:
+        prices = self.get_instruments_navs(time_period=time_period)
+        ppt.plot_top_bottom_performers(prices=prices, num_assets=num_assets, ax=ax, **kwargs)
+
+    def plot_best_worst_returns(self,
+                                time_period: TimePeriod = None,
+                                num_returns: int = 10,
+                                ax: plt.Subplot = None,
+                                **kwargs
+                                ) -> None:
+        price = self.get_portfolio_nav(time_period=time_period)
+        ppt.plot_best_worst_returns(price=price, num_returns=num_returns, ax=ax, **kwargs)
+
+    def plot_pnl(self, time_period: TimePeriod = None) -> None:
+        avg_costs, realized_pnl, mtm_pnl, total_pnl, trades = self.compute_realized_pnl(time_period=time_period)
+        prices = self.prices
+        if time_period is not None:
+            prices = time_period.locate(prices)
+        with sns.axes_style('darkgrid'):
+            fig, axs = plt.subplots(5, 1, figsize=(10, 16), tight_layout=True)
+            pts.plot_time_series(df=prices, legend_stats=pts.LegendStats.FIRST_AVG_LAST, title='prices', ax=axs[0])
+            pts.plot_time_series(df=avg_costs, legend_stats=pts.LegendStats.FIRST_AVG_LAST, title='avg_costs',
+                                 ax=axs[1])
+            pts.plot_time_series(df=realized_pnl, legend_stats=pts.LegendStats.FIRST_AVG_LAST, title='realized_pnl',
+                                 ax=axs[2])
+            pts.plot_time_series(df=mtm_pnl, legend_stats=pts.LegendStats.FIRST_AVG_LAST, title='mtm_pnl', ax=axs[3])
+            pts.plot_time_series(df=total_pnl, legend_stats=pts.LegendStats.FIRST_AVG_LAST, title='total_pnl',
+                                 ax=axs[4])
+
+    def plot_weights(self,
+                     is_input_weights: bool = True,
+                     add_mean_levels: bool = False,
+                     use_bar_plot: bool = False,
+                     columns: List[str] = None,
+                     freq: Optional[str] = None,
+                     is_yaxis_limit_01: bool = True,
+                     bbox_to_anchor: Tuple[float, float] = None,
+                     legend_stats: pst.LegendStats = pst.LegendStats.FIRST_AVG_LAST,
+                     var_format: str = '{:.1%}',
+                     title: Optional[str] = None,
+                     ax: plt.Subplot = None,
+                     **kwargs
+                     ) -> None:
+        weights = self.get_weights(is_input_weights=is_input_weights,
+                                   columns=columns,
+                                   freq=freq)
+        pst.plot_stack(df=weights,
+                       add_mean_levels=add_mean_levels,
+                       use_bar_plot=use_bar_plot,
+                       is_yaxis_limit_01=is_yaxis_limit_01,
+                       bbox_to_anchor=bbox_to_anchor,
+                       title=title,
+                       legend_stats=legend_stats,
+                       var_format=var_format,
+                       ax=ax,
+                       **kwargs)
+
+    def plot_performance_attribution(self,
+                                     time_period: TimePeriod = None,
+                                     attribution_metric: AttributionMetric = AttributionMetric.PNL,
+                                     add_top_bar_values: Optional[bool] = None,
+                                     remove_zero_data: bool = True,
+                                     shorten_instrument_names: bool = True,
+                                     max_bars: Optional[int] = None,
+                                     fontsize: float = 10,
+                                     ax: plt.Subplot = None,
+                                     turnover_computation_type: Optional[
+                                         TurnoverComputationType
+                                     ] = None,
+                                     is_unit_based_traded_volume: Optional[bool] = None,
+                                     vols: Optional[pd.DataFrame] = None,
+                                     **kwargs
+                                     ) -> None:
+        """
+        attribute a portfolio metric across its instruments, one bar per instrument.
+
+        The bar order is the instrument order of the portfolio, which is the group order, so the
+        asset-class blocks are visible. That order is kept until the universe outgrows the panel:
+        past roughly 60 instruments on a half-page panel the rotated tick labels overlap and the
+        panel stops naming anything. Past that point ``max_bars`` reduces it to the tails, sorted
+        by the attributed value, with the folded remainder stated in the title. See
+        :func:`reduce_attribution_to_tails` for the reduction and
+        :func:`qis.plots.utils.estimate_bar_label_capacity` for the geometry.
+
+        Args:
+            time_period: window to attribute over. None uses the full history
+            attribution_metric: what is attributed - P&L, its risk share, costs or turnover
+            add_top_bar_values: print the value above each bar. None prints them at 20 bars or
+                fewer, where they fit
+            remove_zero_data: drop instruments whose attribution is zero, which is what an
+                instrument never traded in the window looks like
+            shorten_instrument_names: truncate names to 15 characters. This bounds how far the
+                labels extend below the axis; it does not widen the axis, because a rotated
+                label is as wide as the font is tall whatever the string says
+            max_bars: bars to keep. None reduces only once the labels would crowd, so a panel
+                that reads today is untouched. 0 disables the reduction and plots everything
+            fontsize: tick label font size, which sets how many labels the panel holds
+            ax: axis to draw on
+            turnover_computation_type: turnover convention for turnover attribution
+            is_unit_based_traded_volume: deprecated turnover selector
+            vols: annualized volatility panel for volatility-normalized weight turnover
+            **kwargs: forwarded to :func:`qis.plot_bars`
+        """
+        data = self.get_performance_attribution_data(attribution_metric=attribution_metric,
+                                                     time_period=time_period,
+                                                     turnover_computation_type=(
+                                                         turnover_computation_type
+                                                     ),
+                                                     is_unit_based_traded_volume=(
+                                                         is_unit_based_traded_volume
+                                                     ),
+                                                     vols=vols,
+                                                     **kwargs)
+        if remove_zero_data:
+            # data = data.replace({0.0: np.nan}).dropna()
+            data[np.isclose(data, 0.0)] = np.nan
+            data = data.dropna()
+
+        if shorten_instrument_names:
+            data.index = [x[:15] for x in data.index]
+
+        is_pnl_attribution = attribution_metric in (
+            AttributionMetric.PNL,
+            AttributionMetric.PNL_RISK,
+        )
+        pnl_var_format = '{:,.1%}'
+
+        # reduce to the tails once the labels would crowd, and say what was folded away
+        title = f"{attribution_metric.value}"
+        if time_period is not None:
+            title += f", for period={time_period.to_str()}"
+        if max_bars is None and ax is not None and isinstance(data, pd.Series):
+            axis_width = put.estimate_axis_width(ax=ax)
+            if axis_width is not None:
+                capacity = put.estimate_bar_label_capacity(axis_width=axis_width,
+                                                           fontsize=fontsize)
+                max_bars = capacity if len(data.index) > capacity else None
+        if max_bars:
+            n_total = len(data.index)
+            is_two_sided = bool(np.nanmin(data) < 0.0 < np.nanmax(data))
+            data, folded_value = reduce_attribution_to_tails(data=data, max_bars=max_bars)
+            n_folded = n_total - len(data.index)
+            if n_folded > 0:
+                side = 'top and bottom' if is_two_sided else 'top'
+                folded_value_label = (
+                    pnl_var_format.format(folded_value)
+                    if is_pnl_attribution else f'{folded_value:.2%}'
+                )
+                title += (f"\n{side} {len(data.index)} of {n_total}: "
+                          f"{n_folded} folded away, summing to {folded_value_label}")
+
+        if add_top_bar_values is None:
+            if isinstance(data, pd.Series) and len(data.index) <= 20:
+                add_top_bar_values = True
+            else:
+                add_top_bar_values = False
+
+        kwargs = qis.update_kwargs(kwargs=kwargs,
+                                   new_kwargs=dict(bbox_to_anchor=(0.5, 1.05),
+                                                   add_top_bar_values=add_top_bar_values,
+                                                   fontsize=fontsize,
+                                                   x_rotation=90))
+        qis.plot_bars(df=data,
+                      skip_y_axis=True,
+                      title=title,
+                      stacked=False,
+                      yvar_format=(pnl_var_format if is_pnl_attribution or add_top_bar_values
+                                   else '{:,.2%}'),
+                      ax=ax,
+                      **kwargs)
+
+    def plot_benchmark_betas(self,
+                             benchmark_prices: pd.DataFrame,
+                             regime_benchmark: str = None,
+                             time_period: TimePeriod = None,
+                             freq: str = 'W-WED',
+                             title: str = None,
+                             beta_span: int = 52,
+                             regime_classifier: BenchmarkReturnsQuantilesRegime = None,
+                             add_zero_line: bool = True,
+                             ax: plt.Subplot = None,
+                             **kwargs
+                             ) -> None:
+        factor_exposures = self.compute_portfolio_benchmark_betas(benchmark_prices=benchmark_prices,
+                                                                  time_period=time_period,
+                                                                  freq_beta=freq,
+                                                                  factor_beta_span=beta_span)
+        qis.plot_time_series(df=factor_exposures,
+                             var_format='{:,.2f}',
+                             legend_stats=qis.LegendStats.AVG_NONNAN_LAST,
+                             title=title or f"Portfolio rolling {beta_span}-span Betas to Benchmarks",
+                             ax=ax,
+                             **kwargs)
+        if regime_benchmark is not None:
+            self.add_regime_shadows(ax=ax, regime_benchmark=regime_benchmark, index=factor_exposures.index,
+                                    regime_classifier=regime_classifier)
+
+        if add_zero_line:
+            ax.axhline(0, color='black', lw=1)
+
+    def plot_portfolio_grouped_var(self,
+                                   is_correlated: bool = True,
+                                   regime_benchmark: str = None,
+                                   time_period: TimePeriod = None,
+                                   freq: str = 'B',
+                                   title: str = None,
+                                   total_column: Optional[str] = 'Total',
+                                   vol_span: int = 33,  # span in number of freq-returns
+                                   regime_classifier: BenchmarkReturnsQuantilesRegime = None,
+                                   ax: plt.Subplot = None,
+                                   **kwargs
+                                   ) -> None:
+        portfolio_vars, instrument_vars = self.compute_portfolio_vars(is_correlated=is_correlated,
+                                                                      time_period=time_period,
+                                                                      freq=freq,
+                                                                      total_column=total_column,
+                                                                      vol_span=vol_span)
+        if is_correlated:
+            title = title or f"Correlated {freq}-freq 99%-VAR with {vol_span}-span ewma covar"
+        else:
+            title = title or f"Independent {freq}-freq 99%-VAR with {vol_span}-span ewma vols"
+
+        qis.plot_time_series(df=portfolio_vars,
+                             var_format='{:,.2%}',
+                             legend_stats=qis.LegendStats.AVG_MIN_MAX_LAST,
+                             title=title,
+                             y_limits=(0.0, None),
+                             ax=ax,
+                             **kwargs)
+
+        if regime_benchmark is not None:
+            self.add_regime_shadows(ax=ax, regime_benchmark=regime_benchmark, index=portfolio_vars.index,
+                                    regime_classifier=regime_classifier)
+
+    def plot_current_weights(self,
+                             is_grouped: bool = False,
+                             add_top_bar_values: Optional[bool] = None,
+                             time_period: TimePeriod = None,
+                             title: str = None,
+                             group_data: pd.Series = None,
+                             group_order: List[str] = None,
+                             ax: plt.Subplot = None,
+                             **kwargs
+                             ) -> None:
+        weights = self.get_weights(is_input_weights=True, freq=None, is_grouped=is_grouped,
+                                   group_data=group_data, group_order=group_order)
+        if time_period is not None:
+            weights_1 = time_period.locate(weights)
+            if len(weights_1.index) > 0:
+                weights_1 = weights_1.iloc[0, :]
+            else:
+                weights_1 = weights.iloc[-1, :]
+        else:
+            weights_1 = weights.iloc[-1, :]
+        if add_top_bar_values is None:
+            if len(weights_1.index) <= 10:
+                add_top_bar_values = True
+            else:
+                add_top_bar_values = False
+        kwargs = qis.update_kwargs(kwargs=kwargs, new_kwargs=dict(legend_loc=None,
+                                                                  add_top_bar_values=add_top_bar_values,
+                                                                  x_rotation=90))
+        if title is None:
+            if is_grouped:
+                title = f"Weights by groups on {date_to_str(weights_1.name)}"
+            else:
+                title = f"Weights by instruments on {date_to_str(weights_1.name)}"
+        qis.plot_bars(df=weights_1,
+                      skip_y_axis=True,
+                      title=title,
+                      stacked=False,
+                      yvar_format='{:,.2%}' if add_top_bar_values else '{:,.2%}',
+                      ax=ax,
+                      **kwargs)
+
+    def plot_last_weights_change(self,
+                                 is_grouped: bool = False,
+                                 title: str = None,
+                                 add_top_bar_values: Optional[bool] = None,
+                                 weights_change_lag: Optional[int] = None,
+                                 ax: plt.Subplot = None,
+                                 **kwargs
+                                 ) -> None:
+        weights = self.get_weights(is_input_weights=True, freq=None, is_grouped=is_grouped)
+        weights_1 = weights.iloc[-1, :]
+        if len(weights.index) > 1:
+            if weights_change_lag is not None:
+                weights_0 = weights.iloc[-weights_change_lag, :]
+            else:
+                weights_0 = weights.iloc[-2, :]
+            delta = weights_1.subtract(weights_0)
+            post_title = f"rebalancing between {date_to_str(weights_0.name)} and {date_to_str(weights_1.name)}"
+        else:
+            delta = weights_1
+            post_title = f"rebalancing on {date_to_str(weights_1.name)} starting from zero"
+        if add_top_bar_values is None:
+            if len(delta.index) <= 10:
+                add_top_bar_values = True
+            else:
+                add_top_bar_values = False
+        kwargs = qis.update_kwargs(kwargs=kwargs, new_kwargs=dict(legend_loc=None,
+                                                                  add_top_bar_values=add_top_bar_values,
+                                                                  x_rotation=90))
+        if title is None:
+            if is_grouped:
+                title = f"Change in weights by groups with {post_title}"
+            else:
+                title = f"Change in weights by instruments with {post_title}"
+        qis.plot_bars(df=delta,
+                      skip_y_axis=True,
+                      title=title,
+                      stacked=False,
+                      yvar_format='{:,.2%}' if add_top_bar_values else '{:,.2%}',
+                      ax=ax,
+                      **kwargs)
+
+    def plot_current_var(self,
+                         snapshot_period: SnapshotPeriod = SnapshotPeriod.LAST,
+                         is_grouped: bool = False,
+                         is_correlated: bool = True,
+                         time_period: TimePeriod = None,
+                         freq: str = 'B',
+                         title: str = None,
+                         add_top_bar_values: Optional[bool] = None,
+                         total_column: Optional[str] = 'Total',
+                         vol_span: Union[int, float] = 33,  # span in number of freq-returns
+                         ax: plt.Subplot = None,
+                         **kwargs
+                         ) -> None:
+        portfolio_vars, instrument_vars = self.compute_portfolio_vars(is_correlated=is_correlated,
+                                                                      time_period=time_period,
+                                                                      freq=freq,
+                                                                      total_column=total_column,
+                                                                      vol_span=vol_span)
+        if is_grouped:
+            if snapshot_period == SnapshotPeriod.LAST:
+                var_1 = portfolio_vars.iloc[-1, :]
+                if is_correlated:
+                    title = title or f"Correlated {freq}-freq 99%-VAR with {vol_span}-span ewma covar: {date_to_str(var_1.name)}"
+                else:
+                    title = title or f"Independent {freq}-freq 99%-VAR with {vol_span}-span ewma vols: {date_to_str(var_1.name)}"
+            elif snapshot_period == SnapshotPeriod.AVG:
+                var_1 = portfolio_vars.mean(axis=0)
+                period = qis.get_time_period(df=portfolio_vars).to_str(date_separator='-')
+                if is_correlated:
+                    title = title or f"Avg Correlated {freq}-freq 99%-VAR with {vol_span}-span: {period}"
+                else:
+                    title = title or f"Avg Independent {freq}-freq 99%-VAR with {vol_span}-span: {period}"
+            elif snapshot_period == SnapshotPeriod.MAX:
+                var_1 = portfolio_vars.max(0)
+                period = qis.get_time_period(df=portfolio_vars).to_str(date_separator='-')
+                if is_correlated:
+                    title = title or f"Max Correlated {freq}-freq 99%-VAR with {vol_span}-span: {period}"
+                else:
+                    title = title or f"Max Independent {freq}-freq 99%-VAR with {vol_span}-span: {period}"
+            else:
+                raise NotImplementedError(f"snapshot_period={snapshot_period}")
+
+        else:
+            if is_correlated:
+                raise ValueError(f"instrument var is not defined for correlated var ")
+            else:
+                if snapshot_period == SnapshotPeriod.LAST:
+                    var_1 = instrument_vars.iloc[-1, :]
+                    title = title or f"Instrument independent {freq}-freq 99%-VAR with {vol_span}-span ewma vols: {date_to_str(var_1.name)}"
+                elif snapshot_period == SnapshotPeriod.AVG:
+                    var_1 = instrument_vars.mean(axis=0)
+                    period = qis.get_time_period(df=instrument_vars).to_str()
+                    title = title or f"Avg Independent {freq}-freq 99%-VAR with {vol_span}-span ewma vols: {period}"
+                elif snapshot_period == SnapshotPeriod.MAX:
+                    var_1 = instrument_vars.max(0)
+                    period = qis.get_time_period(df=instrument_vars).to_str()
+                    title = title or f"Max Independent {freq}-freq 99%-VAR with {vol_span}-span ewma vols: {period}"
+                else:
+                    raise NotImplementedError(f"snapshot_period={snapshot_period}")
+
+        if add_top_bar_values is None:
+            if len(var_1.index) <= 10:
+                add_top_bar_values = True
+            else:
+                add_top_bar_values = False
+        kwargs = qis.update_kwargs(kwargs=kwargs, new_kwargs=dict(legend_loc=None,
+                                                                  add_bar_values=add_top_bar_values,
+                                                                  x_rotation=90))
+        qis.plot_bars(df=var_1,
+                      skip_y_axis=True,
+                      title=title,
+                      stacked=False,
+                      yvar_format='{:,.2%}',
+                      ax=ax,
+                      **kwargs)
+
+    def plot_var_stack(self,
+                       is_grouped: bool = True,
+                       is_correlated: bool = True,
+                       time_period: TimePeriod = None,
+                       freq: str = 'B',
+                       title: str = None,
+                       stack_freq: Optional[str] = 'W-WED',
+                       vol_span: int = 33,  # span in number of freq-returns
+                       ax: plt.Subplot = None,
+                       **kwargs
+                       ) -> None:
+        portfolio_vars, instrument_vars = self.compute_portfolio_vars(is_correlated=is_correlated,
+                                                                      time_period=time_period,
+                                                                      freq=freq,
+                                                                      total_column=None,
+                                                                      vol_span=vol_span)
+        if is_grouped:
+            var_1 = portfolio_vars
+            if is_correlated:
+                title = title or f"Risk Attribution with Correlated {freq}-freq 99%-VAR with {vol_span}-span ewma covar"
+            else:
+                title = title or f"Risk Attribution with Independent {freq}-freq 99%-VAR with {vol_span}-span ewma vols "
+
+        else:
+            if is_correlated:
+                raise ValueError(f"instrument var is not defined for correlated var ")
+            else:
+                var_1 = instrument_vars
+                title = title or f"Risk Attribution with Instrument independent {freq}-freq 99%-VAR with {vol_span}-span ewma vols"
+
+        if time_period is not None:
+            var_1 = time_period.locate(var_1)
+        if stack_freq is not None:
+            var_1 = var_1.asfreq(stack_freq, method='ffill')
+        df = var_1.divide(np.nansum(var_1, axis=1, keepdims=True))
+        qis.plot_stack(df=df,
+                       is_yaxis_limit_01=True,
+                       use_bar_plot=True,
+                       title=title,
+                       legend_stats=qis.LegendStats.AVG_NONNAN_LAST,
+                       var_format='{:.1%}',
+                       ax=ax,
+                       **qis.update_kwargs(kwargs, dict(bbox_to_anchor=(0.5, 1.05), ncols=2)))
+
+    def plot_distribution_yield(self,
+                                paid_dividends: pd.DataFrame,
+                                time_period: TimePeriod = None,
+                                div_rolling_freq: str = 'ME',
+                                div_rolling_period: int = 12,
+                                axs: List[plt.Subplot] = None,
+                                **kwargs
+                                ):
+        distributions_by_instrument_yield_12m, distribution_yield, distribution_yield_12m = \
+            self.compute_distribution_yield(paid_dividends=paid_dividends,
+                                            time_period=time_period,
+                                            div_rolling_freq=div_rolling_freq,
+                                            div_rolling_period=div_rolling_period)
+        if axs is None:
+            fig1, ax1 = plt.subplots(1, 1, figsize=(14, 10), constrained_layout=True)
+            fig2, ax2 = plt.subplots(1, 1, figsize=(14, 10), constrained_layout=True)
+            axs = [ax1, ax2]
+
+        qis.plot_time_series(distribution_yield_12m,
+                             ax=axs[0],
+                             **kwargs)
+        qis.plot_stack(df=distributions_by_instrument_yield_12m.resample('ME').last(),
+                       use_bar_plot=True,
+                       ax=axs[1],
+                       **kwargs)
+
+    def plot_turnover(self,
+                      regime_benchmark: str = None,
+                      is_agg: bool = False,
+                      is_grouped: bool = False,
+                      group_data: pd.Series = None,
+                      group_order: List[str] = None,
+                      time_period: TimePeriod = None,
+                      turnover_rolling_period: Optional[int] = 260,
+                      freq_turnover: Optional[str] = 'B',
+                      add_total: bool = True,
+                      title: str = None,
+                      regime_classifier: BenchmarkReturnsQuantilesRegime = None,
+                      ax: plt.Subplot = None,
+                      turnover_computation_type: Optional[
+                          TurnoverComputationType
+                      ] = None,
+                      is_unit_based_traded_volume: Optional[bool] = None,
+                      vols: Optional[pd.DataFrame] = None,
+                      **kwargs
+                      ) -> None:
+        turnover = self.get_turnover(is_agg=is_agg,
+                                     is_grouped=is_grouped,
+                                     group_data=group_data,
+                                     group_order=group_order,
+                                     time_period=time_period,
+                                     roll_period=turnover_rolling_period,
+                                     add_total=add_total,
+                                     freq=freq_turnover,
+                                     turnover_computation_type=turnover_computation_type,
+                                     is_unit_based_traded_volume=is_unit_based_traded_volume,
+                                     vols=vols,
+                                     **kwargs)
+        if not turnover.empty:
+            freq = pd.infer_freq(turnover.index)
+            is_volatility_normalized = (
+                turnover_computation_type
+                == TurnoverComputationType.VOLATILITY_NORMALIZED_WEIGHTS
+                or (
+                    turnover_computation_type is None
+                    and is_unit_based_traded_volume is None
+                    and self.turnover_computation_type
+                    == TurnoverComputationType.VOLATILITY_NORMALIZED_WEIGHTS
+                )
+            )
+            turnover_label = (
+                'Volatility-Normalized Weight Turnover'
+                if is_volatility_normalized else 'Two-sided Turnover'
+            )
+            turnover_title = (
+                title
+                or f"{turnover_rolling_period}-period rolling {freq}-freq {turnover_label}"
+            )
+            qis.plot_time_series(df=turnover,
+                                 var_format='{:,.1%}',
+                                 y_limits=(0.0, None),
+                                 legend_stats=qis.LegendStats.AVG_NONNAN_LAST,
+                                 title=turnover_title,
+                                 ax=ax,
+                                 **kwargs)
+            if regime_benchmark is not None and self.benchmark_prices is not None:
+                self.add_regime_shadows(ax=ax, regime_benchmark=regime_benchmark, index=turnover.index,
+                                        regime_classifier=regime_classifier)
+
+
+@njit
+def compute_realized_pnl(prices: np.ndarray,
+                         units: np.ndarray
+                         ) -> Tuple[np.ndarray, ...]:
+    """
+    pnl for long only positions, computes avg entry price and pnl by instrument
+    """
+    avg_costs = np.zeros_like(prices)
+    realized_pnl = np.zeros_like(prices)
+    mtm_pnl = np.zeros_like(prices)
+    trades = np.zeros_like(prices)
+    for idx, (price1, unit1) in enumerate(zip(prices, units)):
+        if idx == 0:
+            avg_costs[idx] = np.where(np.greater(unit1, 1e-16), price1, 0.0)
+        else:
+            unit0 = units[idx - 1]
+            avg_costs0 = avg_costs[idx - 1]
+            delta = unit1 - unit0
+            is_purchase = np.greater(delta, 1e-16)
+            is_sell = np.less(delta, -1e-16)
+            realized_pnl[idx] = np.where(is_sell, -delta * (price1 - avg_costs0), 0.0)
+            avg_costs[idx] = np.where(is_purchase, np.true_divide(delta * price1 + unit0 * avg_costs0, unit1),
+                                      avg_costs0)
+            mtm_pnl[idx] = unit0 * (price1 - avg_costs0) - realized_pnl[idx]
+            trades[idx] = delta
+    return avg_costs, realized_pnl, mtm_pnl, trades
+
+
+class AllocationType(EnumMap):
+    EW = 1
+    FIXED_WEIGHTS = 2
+    ERC = 3
+    ERC_ALT = 4
+
+
+@dataclass
+class PortfolioInput:
+    """
+    define data inputs for portfolio construction
+    """
+    name: str
+    weights: Union[np.ndarray, pd.DataFrame, Dict[str, float]]
+    prices: pd.DataFrame = None  # mandatory but we set none for enumarators
+    allocation_type: AllocationType = AllocationType.FIXED_WEIGHTS
+    time_period: TimePeriod = None
+    rebalancing_freq: str = 'QE'
+    freq_regime: str = 'ME'
+    returns_freq: str = 'ME'
+    ewm_lambda: float = 0.92
+    target_vol: float = None
+
+    def update(self, new: Dict[str, Any]):
+        for key, value in new.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
