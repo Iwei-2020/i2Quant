@@ -1,0 +1,334 @@
+"""
+group-by operations driven by ``group_data``: a pd.Series indexed by ticker whose values are the
+group labels.
+
+``get_group_dict`` inverts that Series into group to tickers and the splitting and aggregating
+functions route through it: groups alphabetical by default, ``group_order`` fixing their order
+and appending any group outside the list, ``total_column`` adding a group holding every ticker,
+and a group with no column present in the frame dropped rather than returned empty.
+
+``split_df_by_groups`` returns one time-by-asset sub-panel per group, ``agg_df_by_groups``
+collapses each group to a single column with ``agg_func`` (``df_nansum`` by default), and
+``set_group_loadings`` gives the one-hot matrix for which loadings.T @ x aggregates an
+instrument-indexed vector to group level - it bypasses ``get_group_dict``, ordering groups by
+first appearance and dropping any outside ``group_order``.
+"""
+# packages
+import numpy as np
+import pandas as pd
+from typing import Union, List, Dict, Callable, Optional
+
+# qis
+import qis.utils.struct_ops as sop
+import qis.utils.df_agg as dfa
+
+
+def get_group_dict(group_data: pd.Series,
+                   index_data: Union[pd.Index, List[str], np.ndarray] = None,
+                   group_order: List[str] = None,
+                   total_column: Union[str, None] = None
+                   ) -> Dict[str, List[str]]:
+    """
+    map each group label to the tickers belonging to it.
+
+    ``group_data`` is the house convention for asset-class metadata: a Series indexed by ticker
+    whose values are the group labels. This inverts it into group to tickers, which is the shape
+    the grouped reporting layer consumes.
+
+    Args:
+        group_data: group label per ticker, indexed by ticker
+        index_data: restrict the result to these tickers, and order them accordingly. None uses
+            every ticker in ``group_data``
+        group_order: order of the groups in the result. None orders by first appearance
+        total_column: name of an extra group holding every ticker, for a total row alongside the
+            groups. None adds none
+
+    Returns:
+        group label to the tickers in it, in ``group_order``
+
+    Raises:
+        ValueError: if ``group_data`` is not a Series, or if it or ``index_data`` contains nulls
+        TypeError: if ``index_data`` is not an Index, list or array
+    """
+    if not isinstance(group_data, pd.Series):
+        raise ValueError(f"group_data type={type(group_data)} must be series")
+
+    if np.any(group_data.isnull()):
+        raise ValueError(f"group data is nan\ngroup_data=\n{group_data}:"
+                         f"\n{group_data.loc[np.isnan(group_data.isnull())]}")
+
+    if index_data is not None:
+        if isinstance(index_data, list) or isinstance(index_data, np.ndarray):  # convert to Index
+            index_data = pd.Index(index_data)
+        elif not isinstance(index_data, pd.Index):
+            raise TypeError(f"unsupported type {type(index_data)}")
+        if np.any(index_data.isnull()):
+            raise ValueError(f"index_data is nan:\n{index_data[index_data.isnull()]}")
+
+    group_data_ls = group_data.to_list()
+    data_groups = list(np.unique(group_data_ls))
+    if group_order is not None:
+        groups = sop.merge_lists_unique(list1=group_order, list2=data_groups)
+    else:
+        groups = data_groups
+
+    # fill group dict
+    group_dict = {}
+    if total_column is not None:
+        group_tickers = group_data.index
+        if index_data is not None:  # match group_tickers in index_data: necessary if index_data != group_data.index
+            group_tickers = index_data[np.isin(index_data, group_tickers, assume_unique=True)]
+        group_dict[total_column] = group_tickers
+
+    # match group to instruments in group_data
+    for group in groups:
+        if group in data_groups:
+            group_instruments = group_data.index[np.isin(group_data_ls, [group], assume_unique=True)]
+            if index_data is not None:  # match group_tickers in index_data: necessary if index_data != group_data.index
+                group_instruments = index_data[np.isin(index_data, group_instruments, assume_unique=True)]
+            group_dict[group] = group_instruments.to_list()
+
+    return group_dict
+
+
+def split_df_by_groups(df: pd.DataFrame,
+                       group_data: pd.Series,
+                       total_column: Union[str, None] = None,
+                       group_order: List[str] = None
+                       ) -> Dict[str, pd.DataFrame]:
+    """
+    split a panel's columns into one frame per group.
+
+    The frame is time by asset and ``group_data`` maps asset to group, so this returns one
+    time-by-asset frame per group. Groups with no columns present in ``df`` are omitted rather than
+    returned empty.
+
+    Args:
+        df: panel indexed by date with one column per asset
+        group_data: group label per asset, indexed by asset
+        total_column: name of an extra group holding every column. None adds none
+        group_order: order of the groups. None orders by first appearance
+
+    Returns:
+        group label to the sub-panel of ``df``, each a copy rather than a view
+    """
+    # group by descriptive data
+    group_dict = get_group_dict(group_data=group_data,
+                                index_data=df.columns.to_numpy(),
+                                group_order=group_order,
+                                total_column=total_column)
+
+    grouped_data = {}
+    for key, columns in group_dict.items():
+        if len(columns) > 0:  # get subset of pandas by columns, copy() to break view
+            grouped_data[key] = df[columns].copy()
+
+    return grouped_data
+
+
+def agg_df_by_groups_ax1(df: pd.DataFrame,
+                         group_data: pd.Series,
+                         agg_func: Callable[[pd.DataFrame], pd.Series] = np.nansum,
+                         total_column: Union[str, None] = None,
+                         group_order: List[str] = None
+                         ) -> pd.DataFrame:
+    """
+    take df[index=time series, data = asset data]
+    slit data according to grouping by rows in group_data[asset_group_column] in group_data
+    agg data by groups
+    """
+    # group by descriptive data
+    group_dict = get_group_dict(group_data=group_data,
+                                index_data=df.columns.to_numpy(),
+                                group_order=group_order,
+                                total_column=total_column)
+
+    grouped_data = {}
+    for key, columns in group_dict.items():
+        if len(columns) > 0:  # get subset of pandas by columns, copy() to break view
+            grouped_data[key] = df[columns].apply(agg_func, axis=1).rename(key)
+    grouped_data = pd.DataFrame.from_dict(grouped_data, orient='columns')
+    return grouped_data
+
+
+def agg_df_by_groups(df: pd.DataFrame,
+                     group_data: pd.Series,
+                     group: str = None,
+                     agg_func: Callable[[pd.DataFrame], pd.Series] = dfa.df_nansum,
+                     total_column: Union[str, None] = None,
+                     is_total_first: bool = True,
+                     group_order: List[str] = None,
+                     axis: Optional[int] = 1  # axis for integration
+                     ) -> pd.DataFrame:
+    """
+    take pandas data which are index=time series, data = instruments
+    slit data according to grouping by rows in group_data[group_column] in group_data
+    the match of columns in data to rows in group_data is done using group_data.index or group_data[ticker_column_to_match]
+    agg_func: pd.DataFrame -> Union[pd.Series, pd.DataFrame] is function for aggregation
+    """
+    # group by descriptive data
+    group_dict = get_group_dict(group_data=group_data,
+                                index_data=df.columns.to_numpy(),
+                                group_order=group_order)
+
+    # apply agg_func to grouped pandas
+    agg_grouped_datas = []
+    if group is None:  # output pandas with columns by dictionary keys
+        for key, group_columns in group_dict.items():
+            if len(group_columns) > 0:
+                agg_grouped_datas.append(agg_func(df[group_columns], axis=axis).rename(key))
+        if len(agg_grouped_datas) > 0:
+            agg_grouped_data = pd.concat(agg_grouped_datas, axis=1, sort=True)
+        else:
+            agg_grouped_data = pd.DataFrame()
+
+    else:  # just take the group
+        if group in group_dict.keys():
+            agg_grouped_data = agg_func(df[group_dict[group]]).to_frame(name=group)
+        else:
+            raise ValueError(f"{group} in keys {group_dict.keys()}")
+
+    # insert total
+    if total_column is not None:
+        if not isinstance(total_column, str):
+            raise TypeError(f"in agg_data_by_groups: {total_column} must be string")
+        total = agg_func(df)
+        if is_total_first:
+            agg_grouped_data.insert(loc=0, column=total_column, value=total.values)
+        else:
+            agg_grouped_data.insert(loc=len(agg_grouped_data.columns), column=total_column, value=total.values)
+    return agg_grouped_data
+
+
+def agg_df_by_group_with_avg(df: pd.DataFrame,
+                             group_data: pd.Series,
+                             group_order: List[str] = None,
+                             agg_func: Callable = dfa.df_nanmean,
+                             agg_func_id: str = 'mean',
+                             total_column: str = 'Universe mean'
+                             ) -> Dict[str, pd.DataFrame]:
+    """
+    create ac grouped data dict with universes median and group medians
+    """
+    grouped_data = split_df_by_groups(df=df,
+                                      group_data=group_data,
+                                      group_order=group_order,
+                                      total_column=None)
+
+    group_avg = agg_df_by_groups(df=df,
+                                 group_data=group_data,
+                                 agg_func=agg_func,
+                                 total_column=total_column)
+
+    # add group median to grouped_data
+    grouped_data_avg = dict()
+    grouped_data_avg[total_column] = group_avg
+    for ac_id, ac_data in grouped_data.items():
+        data_avg = group_avg[ac_id].rename(f"{ac_id} {agg_func_id}")
+        ac_data = pd.concat([data_avg, ac_data], axis=1, sort=True)
+        grouped_data_avg[ac_id] = ac_data
+
+    return grouped_data_avg
+
+
+def fill_df_with_group_avg(df: pd.DataFrame,
+                           group_data: pd.Series,
+                           agg_func: Callable[[pd.DataFrame], pd.Series] = dfa.df_nanmean,
+                           group_order: List[str] = None
+                           ) -> pd.DataFrame:
+    """
+    compute group avg and return data for each column with corresponding group avg
+    """
+    group_avg = agg_df_by_groups(df=df,
+                                 group_data=group_data,
+                                 group_order=group_order,
+                                 agg_func=agg_func,
+                                 total_column=None)
+    avg_data = {}
+    for column in df.columns:
+        avg_data[column] = group_avg[group_data[column]]
+    avg_data = pd.DataFrame.from_dict(avg_data, orient='columns')
+    return avg_data
+
+
+def sort_df_by_index_group(df: pd.DataFrame,
+                           group_column: str,
+                           sort_column: str,
+                           ascending: bool = False,
+                           group_order: List[str] = None
+                           ) -> pd.DataFrame:
+
+    group_dict = get_group_dict(group_data=df[group_column],
+                                group_order=group_order)
+    sorted_datas = []
+    for group, tickers in group_dict.items():
+        sorted_datas.append(df.loc[tickers, :].sort_values(by=[sort_column], ascending=ascending))
+    sorted_data = pd.concat(sorted_datas, axis=0)
+
+    return sorted_data
+
+
+def set_group_loadings(group_data: pd.Series, group_order: List[str] = None) -> pd.DataFrame:
+    """
+    one-hot loadings of instruments on groups.
+
+    Column g holds 1.0 where ``group_data`` equals g and 0.0 elsewhere, so
+    ``loadings.T @ x`` aggregates an instrument-indexed vector to group level.
+
+    Args:
+        group_data: group label per instrument, indexed by ticker
+        group_order: groups to emit, in column order; defaults to the order of first
+            appearance in ``group_data``. Groups outside the list are dropped, and a group in
+            the list that never occurs yields an all-zero column
+
+    Returns:
+        loadings indexed as ``group_data``, one column per group, values 1.0 or 0.0
+
+    Raises:
+        ValueError: if ``group_data`` is not a pd.Series
+    """
+    if not isinstance(group_data, pd.Series):
+        raise ValueError(f"{type(group_data)} must be pd.Series")
+    if group_order is None:
+        group_order = group_data.unique()
+    group_loadings = {}
+    for group in group_order:
+        group_loadings[group] = pd.Series(np.where(group_data == group, 1.0, 0.0), index=group_data.index)
+    group_loadings = pd.DataFrame.from_dict(group_loadings, orient='columns')
+    return group_loadings
+
+
+def convert_df_column_to_df_by_groups(df: pd.DataFrame,
+                                      group_data: pd.Series,
+                                      column: str,
+                                      total_column: Union[str, None] = None,
+                                      group_order: List[str] = None
+                                      ) -> pd.DataFrame:
+    """
+    df is dataframe with index = assets
+    group_data is series with index = assets and value = groups
+    take dataframe column: split it to groups and produce df of values with columns = groups
+    the index value is lost
+    """
+    # create df dict
+    dfs = split_df_by_groups(df=df[column].to_frame().T, group_data=group_data,
+                             total_column=total_column,
+                             group_order=group_order)
+    dfs1 = {}
+    for key, df in dfs.items():
+        dfs1[key] = df.T.reset_index(drop=True)[column]  # make series from df
+    df1 = pd.DataFrame.from_dict(dfs1, orient='columns')
+    return df1
+
+
+def flatten_group_attribution(group_attribs: Dict[str, Dict[str, pd.DataFrame]]) -> Dict[str, pd.DataFrame]:
+    """Flatten nested group attribution into one DataFrame per group."""
+    result = {}
+    for group_name, metrics_dict in group_attribs.items():
+        dfs = []
+        for metric_name, df in metrics_dict.items():
+            df_copy = df.copy()
+            df_copy.insert(0, 'metric', metric_name)
+            dfs.append(df_copy)
+        result[group_name] = pd.concat(dfs, axis=0)
+    return result

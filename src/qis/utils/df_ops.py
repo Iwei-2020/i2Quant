@@ -1,0 +1,552 @@
+"""
+pandas operations on a time-by-asset panel: nan boundaries, alignment and fills.
+
+``get_nonnan_index`` gives the first or last non-nan date per column and the nan-boundary helpers
+build on it, ``df_price_ffill_between_nans`` among them: it fills gaps only between a column's
+first and last observation, so a column that starts late is not back-filled into a flat price.
+The input index is restored only on the leading side, so trailing dates past every column's last
+observation are dropped rather than returned as nan.
+
+``align_df1_to_df2`` and ``align_dfs_dict_with_df`` are the alignment entry points.
+``multiply_df_by_dt`` converts an annualised rate into a per-period accrual by multiplying by the
+actual calendar days between index dates over ``annualization_factor`` (365 by default), with the
+first date carrying dt = 0, and ``lag`` shifting the rate before the reindex.
+
+Numpy work without an index is ``np_ops.py``; aggregation across columns is ``df_agg.py``.
+"""
+# packages
+import warnings
+import numpy as np
+import pandas as pd
+from scipy import stats
+from typing import Union, List, Optional, Dict, Tuple, Type, Any, Literal
+
+
+def df_zero_like(df: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame(data=np.zeros(df.shape), index=df.index, columns=df.columns)
+
+
+def df_ones_like(df: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame(data=np.ones(df.shape), index=df.index, columns=df.columns)
+
+
+def df_indicator_like(df: pd.DataFrame, type: Type = bool) -> pd.DataFrame:
+    """
+    return df_indicator = True is set is not None and False otherwise
+    """
+    data = (df.isna() == False).astype(type)
+    return pd.DataFrame(data=data, index=df.index, columns=df.columns)
+
+
+def df_joint_indicator(indicator1: pd.DataFrame,
+                       indicator2: Union[np.ndarray, pd.DataFrame],
+                       to_float: bool = False
+                       ) -> pd.DataFrame:
+    """
+    return df_indicator = True if indicator1 is True and indicator2 is True
+    """
+    if isinstance(indicator2, pd.DataFrame):
+        np_indicator2 = indicator2.to_numpy(dtype=bool)
+    elif isinstance(indicator2, np.ndarray):
+        np_indicator2 = indicator2.astype(bool)
+    else:
+        raise ValueError(f"unsupported type {type(indicator2)}")
+
+    data = np.logical_and(indicator1.to_numpy(dtype=bool), np_indicator2)
+
+    if to_float:
+        data = data.astype(np.float64)
+
+    return pd.DataFrame(data=data, index=indicator1.index, columns=indicator1.columns)
+
+
+def drop_first_nan_data(df: Union[pd.Series, pd.DataFrame],
+                        is_oldest: bool = True  # the olderst, the eldest (all non nnans)
+                        ) -> Union[pd.Series, pd.DataFrame]:
+    """
+    drop data before first nonnan either at max or at min for pandas
+    the rest of data can still contain occasional nans
+    """
+    first_nonnan_index = get_nonnan_index(df=df, position='first')
+
+    if isinstance(df, pd.DataFrame):
+        if is_oldest:
+            joint_start = min(first_nonnan_index)
+        else:
+            joint_start = max(first_nonnan_index)
+        new_data = df[joint_start:].copy()
+    else:
+        new_data = df.loc[first_nonnan_index:].copy()
+
+    return new_data
+
+
+def get_nonnan_index(df: Union[pd.Series, pd.DataFrame],
+                     position: Literal['first', 'last'] = 'first',  # 'first' or 'last'
+                     return_index_for_all_nans: int = -1
+                     ) -> Union[pd.Timestamp, List[pd.Timestamp]]:
+    """
+    Get the first or last non-NaN index for each column/series.
+
+    Args:
+        df: series or frame to scan
+        position: which end to look from, ``'first'`` or ``'last'``
+        return_index_for_all_nans: positional index returned for an all-NaN column, so an empty
+            column yields a date rather than raising. -1 gives the last index entry, 0 the first
+
+    Returns:
+        the timestamp for a Series, or one timestamp per column for a DataFrame
+    """
+
+    def get_index(series: pd.Series) -> pd.Timestamp:
+        mask = series.notna()
+        if mask.any():
+            if position == 'first':
+                return mask.idxmax()
+            else:  # 'last'
+                return series[mask].index[-1]
+        else:
+            return series.index[return_index_for_all_nans]
+
+    if isinstance(df, pd.Series):
+        return get_index(df)
+    elif isinstance(df, pd.DataFrame):
+        return [get_index(df[col]) for col in df.columns]
+    else:
+        raise TypeError(f"Unsupported data type: {type(df)}")
+
+
+def compute_nans_zeros_ratio_after_first_non_nan(df: Union[pd.Series, pd.DataFrame],
+                                                 zero_cutoff: float = 1e-12
+                                                 ) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute missing and near-zero ratios after each series begins.
+
+    Leading missing values before the first observation are outside the denominator. An
+    all-missing series has complete missing coverage and an undefined near-zero ratio because no
+    observed window exists.
+
+    Args:
+        df: Series or time-by-variable DataFrame whose columns are evaluated independently.
+        zero_cutoff: Strict absolute-value threshold used to classify a finite value as near zero.
+
+    Returns:
+        Missing ratios and near-zero ratios aligned to the input column order.
+    """
+    data = df.to_frame() if isinstance(df, pd.Series) else df
+
+    missing: List[float] = []
+    zeros: List[float] = []
+    for _, column_data in data.items():
+        assert isinstance(column_data, pd.Series)
+        column_values: np.ndarray = column_data.to_numpy(dtype=float, na_value=np.nan)
+        nonnan_cond = ~np.isnan(column_values)
+        if not bool(nonnan_cond.any()):
+            # No observation defines a zero-ratio window, but coverage is entirely missing.
+            missing.append(1.0)
+            zeros.append(np.nan)
+            continue
+
+        # Begin both diagnostic denominators at this column's first observed position.
+        first_nonnan_position = int(np.flatnonzero(nonnan_cond)[0])
+        after_values = column_values[first_nonnan_position:]
+        after_count = len(after_values)
+        missing_count = np.count_nonzero(np.isnan(after_values))
+        zero_count = np.count_nonzero(np.abs(after_values) < zero_cutoff)
+        missing.append(float(missing_count / after_count))
+        zeros.append(float(zero_count / after_count))
+
+    return np.asarray(missing, dtype=float), np.asarray(zeros, dtype=float)
+
+
+def get_first_nonnan_values(df: Union[np.ndarray, pd.Series, pd.DataFrame]) -> Union[np.ndarray, float]:
+
+    if isinstance(df, pd.DataFrame) or isinstance(df, pd.Series):
+        if df.empty:
+            raise ValueError(f"data is empty:\n {df}")
+
+    def get_non_nan_values_series(sdata: pd.Series) -> float:
+        x0 = sdata.iloc[0]
+        if not np.isnan(x0):
+            values = x0
+        else:
+            nonnan_column_data = sdata[~sdata.isnull()]
+            if nonnan_column_data.empty:
+                warnings.warn(f"all nans in {df}", stacklevel=2)
+                values = np.nan
+            else:
+                values = nonnan_column_data.iloc[0]
+        return values
+
+    if isinstance(df, pd.DataFrame):
+        x0 = df.iloc[0, :].to_numpy(float)
+        if np.all(np.isnan(x0) == False):  # first entries are non nan -> most expected
+            values = x0
+        else:
+            values = []
+            for column in df:
+                values.append(get_non_nan_values_series(sdata=df[column]))
+            values = np.array(values)
+
+    elif isinstance(df, pd.Series):
+            values = get_non_nan_values_series(sdata=df)
+
+    elif isinstance(df, np.ndarray):
+        x0 = df[0]
+        if np.all(np.isnan(x0) == False):  # first entries are non nan -> most expected
+            values = x0
+        else:
+            values = []
+            for idx in np.arange(df.shape[1]):
+                values.append(get_non_nan_values_series(sdata=pd.Series(df[:, idx])))
+            values = np.array(values)
+
+    else:
+        raise ValueError(f"unsupported data type = {type(df)}")
+
+    return values
+
+
+def get_last_nonnan_values(df: Union[pd.Series, pd.DataFrame]) -> Union[np.ndarray, float]:
+    if df.empty:
+        raise ValueError(f"data is empty:\n {df}")
+
+    def get_non_nan_values_series(ds: pd.Series) -> float:
+        x1 = ds.iloc[-1]
+        if not pd.isna(x1):
+            values = x1
+        else:
+            nonnan_column_data = ds[~ds.isnull()]
+            if nonnan_column_data.empty:
+                # print(f"in get_last_non_nan_values: all nans in {ds}")
+                values = np.nan
+            else:
+                values = nonnan_column_data.iloc[-1]
+        return values
+
+    if isinstance(df, pd.DataFrame):
+        x1 = df.iloc[-1, :].to_numpy()
+        if np.all(pd.isna(x1) == False):  # first entries are non nan -> most expected
+            values = x1
+        else:
+            values = []
+            for column in df:
+                values.append(get_non_nan_values_series(ds=df[column]))
+            values = np.array(values)
+
+    elif isinstance(df, pd.Series):
+        values = get_non_nan_values_series(ds=df)
+
+    else:
+        raise ValueError(f"unsupported data type = {type(df)}")
+
+    return values
+
+
+def get_last_nonnan(df: Union[pd.Series, pd.DataFrame]) -> pd.Series:
+    values = get_last_nonnan_values(df=df)
+    if isinstance(df, pd.DataFrame):
+        ds = pd.Series(values, index=df.columns)
+    else:
+        ds = pd.Series(values, index=[df.name])
+    return ds
+
+
+def multiply_df_by_dt(df: Union[pd.DataFrame, pd.Series],
+                      dates: Union[pd.DatetimeIndex, pd.Index] = None,
+                      lag: Optional[int] = None,
+                      is_actual_calendar_dt: bool = True,
+                      annualization_factor: float = 365.0
+                      ) -> Union[pd.DataFrame, pd.Series]:
+    """
+    to compute rate adjustment with data - rate:
+    get data at dates index and adjust by dt if needed
+    adjust data by time spread:
+    data = dt*data
+    """
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise TypeError(f"data index must be DateTimeIndex: {df.index}")
+
+    if lag is not None:
+        if len(df.index) > lag:
+            df = df.shift(lag)
+
+    if dates is not None:
+        # align tz
+        if isinstance(dates, pd.DatetimeIndex) and df.index.tz is not None:
+            df.index = df.index.tz_convert(dates.tz)
+        df = df.reindex(index=dates, method='ffill')
+
+    # apply dt multiplication
+    if len(df.index) > 1:
+        if is_actual_calendar_dt:
+            delta = np.append(0.0, (df.index[1:] - df.index[:-1]).days / annualization_factor)
+        else:
+            delta = 1.0 / annualization_factor
+        df = df.multiply(delta, axis=0)
+    else:
+        warnings.warn(f"in adjust_data_with_dt: lengh of data index is one - cannot adjust by dt")
+        return df
+
+    return df
+
+
+def np_txy_tensor_to_pd_dict(np_tensor_txy: np.ndarray,
+                             dateindex: Union[pd.Index, pd.DatetimeIndex],
+                             factor_names: Union[pd.Index, List[str]],
+                             asset_names: Union[pd.Index, List[str]],
+                             is_factor_view: bool = True
+                             ) -> Dict[str, pd.DataFrame]:
+    """
+    np_tensor_txy is an output of factor model: betas = [time, factor, asset]
+    given timeindex such that #timeindex = time
+    convert to:
+    factor view = dict{factor: set[timeindex, asset]}  for each factor exp by assets
+    asset view = dict{asset: set[timeindex, factor]}  for each asset exp by factor
+    """
+    if np_tensor_txy.ndim != 3:
+        raise TypeError(f"np_tensor must ne 3-d tensor")
+    if len(dateindex) != np_tensor_txy.shape[0]:
+        raise TypeError(f"time dimension must be equal")
+    if len(factor_names) != np_tensor_txy.shape[1]:
+        raise TypeError(f"factor dimension must be equal")
+    if len(asset_names) != np_tensor_txy.shape[2]:
+        raise TypeError(f"asset dimension must be equal")
+
+    if is_factor_view:  # {factor_id: pd.DataFrame(factor loadings)}
+        factor_loadings = {}
+        for factor_idx, factor in enumerate(factor_names):
+            factor_loadings[factor] = pd.DataFrame(data=np_tensor_txy[:, factor_idx, :],
+                                                   index=dateindex,
+                                                   columns=asset_names)
+
+    else:  # {asset_id: pd.DataFrame(factor loadings)}
+        factor_loadings = {}
+        for asset_idx, asset in enumerate(asset_names):
+            factor_loadings[asset] = pd.DataFrame(data=np_tensor_txy[:, :, asset_idx],
+                                                  index=dateindex,
+                                                  columns=factor_names)
+    return factor_loadings
+
+
+def compute_last_score(df: Union[pd.DataFrame, pd.Series], is_percent: bool = True) -> pd.Series:
+    """
+    columnwise score for last value in data
+    use column wise loop with percentileofscore (as it supports only float for score)
+    """
+    if isinstance(df, pd.Series):
+        df = df.to_frame()
+
+    percentiles = []
+    for column in df.columns:
+        x = df[column].dropna()
+        percentiles.append(stats.percentileofscore(a=x, score=x.iloc[-1], kind='rank'))
+    percentiles = pd.Series(percentiles, index=df.columns)
+    if is_percent:
+        percentiles = percentiles.multiply(0.01)
+
+    return percentiles
+
+
+def align_dfs_dict_with_df(dfd: Dict[Any, pd.DataFrame],
+                           df: pd.DataFrame,
+                           fill_na_method: Optional[str] = 'ffill'
+                           ) -> Dict[Any, pd.DataFrame]:
+    """
+    align dict of dataframes with given df
+    """
+    alignment_columns = df.columns
+    alignment_index = df.index
+    aligned_dfd = {}
+    for key, df in dfd.items():
+        if df is not None:  # align with other pandas in dict by filtered value
+            df = df[alignment_columns].reindex(index=alignment_index)
+            if fill_na_method is not None:
+                if fill_na_method == 'ffill':
+                    df = df.ffill()
+                elif fill_na_method == 'bfill':
+                    df = df.bfill()
+                else:
+                    raise NotImplementedError(f"fill_na_method={fill_na_method}")
+            aligned_dfd[key] = df
+        else:
+            aligned_dfd[key] = None
+    return aligned_dfd
+
+
+def align_df1_to_df2(df1: pd.DataFrame,
+                     df2: pd.DataFrame,
+                     join: Literal['inner', 'outer', 'left', 'right'] = 'inner',
+                     axis: Optional[int] = None
+                     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    align dataframes
+    join='inner' with strict match
+    join='outer' without strict match so missing data has na
+    """
+    if isinstance(df1, pd.DataFrame) and isinstance(df2, pd.DataFrame):
+        pass
+    else:
+        raise TypeError(f"df1 and df2 must be dataframes")
+
+    df1_, df2_ = df1.align(other=df2, join=join, axis=axis)
+
+    if join == 'inner':
+        if len(df1.index) != len(df1_.index) or len(df2.index) != len(df2_.index):
+            raise ValueError(f"df1 and df2 index are not matched: {df1.index} vs {df2.index}")
+
+        elif len(df1.columns) != len(df1_.columns) or len(df2.columns) != len(df2_.columns):
+            raise ValueError(f"df1 and df2 columns are not matched: {df1.columns} vs {df2.columns}")
+
+    return df1_, df2_
+
+
+def merge_dfs_on_column(data_df: pd.DataFrame,
+                        index_df: pd.DataFrame,
+                        index_column_in_data_df: str = 'bbg_ticker'
+                        ) -> pd.DataFrame:
+    """
+    merge data_df with index_df using index_column_in_data_df
+    index_df
+    """
+    data_df.index.name = 'index1'  # rename index
+    index_df.index.name = 'index2'  # rename index
+    # align dfs by index_column_in_data_df
+    index_df_joint_data = index_df.reindex(index=data_df[index_column_in_data_df].to_list())
+    # merge aligned dfs with reset index
+    joint_data = pd.concat([data_df.reset_index(drop=False),
+                            index_df_joint_data.reset_index(drop=False)],
+                           axis=1, sort=False)
+    joint_data = joint_data.set_index(data_df.index.name)
+    return joint_data
+
+
+def reindex_upto_last_nonnan(ds: pd.Series,
+                             index: pd.DatetimeIndex,
+                             method: Literal["backfill", "bfill", "ffill", "pad", "nearest"] | None = 'ffill'
+                             ) -> pd.Series:
+    """
+    apply ffill up to the last value
+    """
+    filled_ds = ds.reindex(index=index, method=method)
+    last_non_nan = get_nonnan_index(df=ds, position='last')
+    if filled_ds.index[-1] > last_non_nan:
+        if last_non_nan in filled_ds.index:
+            idx = filled_ds.index.get_loc(last_non_nan)  # find idx
+            filled_ds.iloc[idx+1:] = np.nan
+        else:
+            filled_ds.loc[last_non_nan:] = np.nan
+    return filled_ds
+
+
+def df_align_to_common_index(df1: pd.DataFrame, df2: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    common_index = df1.index.intersection(df2.index, sort=False)  # Preserves order from df1.index
+    df1 = df1.loc[common_index]
+    df2 = df2.loc[common_index]
+    return df1, df2
+
+
+def check_df_for_duplicated_columns_index(df: pd.DataFrame) -> bool:
+    # Check for duplicated columns
+    duplicated_columns = df.columns[df.columns.duplicated()].tolist()
+    if duplicated_columns:
+        unique_dupes = list(set(duplicated_columns))
+        raise AssertionError(
+            f"Found {len(duplicated_columns)} duplicated column(s): {unique_dupes}"
+        )
+
+    # Check for duplicated index
+    duplicated_index = df.index[df.index.duplicated()].tolist()
+    if duplicated_index:
+        unique_dupes = list(set(duplicated_index))
+        raise AssertionError(
+            f"Found {len(duplicated_index)} duplicated index value(s): {unique_dupes}"
+        )
+    return True
+
+
+def df_price_ffill_between_nans(prices: Union[pd.Series, pd.DataFrame],
+                                method: Optional[str] = 'ffill'
+                                ) -> Union[pd.Series, pd.DataFrame]:
+    """Forward-fill prices only between first and last non-NaN dates.
+
+    Preserves leading and trailing NaN values while filling gaps.
+
+    Args:
+        prices: Price time series
+        method: Fill method ('ffill', 'bfill', or None)
+
+    Returns:
+        Price series with gaps filled between first and last valid observations
+    """
+    is_series_out = False
+    if isinstance(prices, pd.Series):
+        is_series_out = True
+        prices = prices.to_frame()
+
+    # Get first and last valid dates for each column
+    first_date = get_nonnan_index(df=prices, position='first')
+    last_date = get_nonnan_index(df=prices, position='last')
+
+    # Fill only between valid date ranges
+    good_parts = []
+    for idx, column in enumerate(prices.columns):
+        good_price = prices.loc[first_date[idx]:last_date[idx], column]
+        # Honour the `method` parameter — previously this branch
+        # hardcoded .ffill() regardless of method, so callers passing
+        # method='bfill' silently got ffill behaviour. Now method
+        # dispatches correctly. method=None still skips filling and
+        # returns gaps as NaN inside the valid date range.
+        if method == 'ffill':
+            good_price = good_price.infer_objects().ffill()
+        elif method == 'bfill':
+            good_price = good_price.infer_objects().bfill()
+        elif method is not None:
+            raise NotImplementedError(f"method={method} not supported")
+        good_parts.append(good_price)
+
+    bfilled_data = pd.concat(good_parts, axis=1, sort=True)
+    if bfilled_data.index[0] > prices.index[0]:
+        bfilled_data = bfilled_data.reindex(index=prices.index)
+
+    if is_series_out:
+        bfilled_data = bfilled_data.iloc[:, 0]
+    return bfilled_data
+
+
+def df_ffill_negatives(df: Union[pd.DataFrame, pd.Series]) -> Union[pd.DataFrame, pd.Series]:
+    """
+    use ffill for filling negative prices
+    """
+    nans_mask = pd.isna(df)
+    df = df.where(df >= 0.0, other=0.0).replace({0.0: np.nan}).ffill()
+    # where will convert nans to zeros, replace zeros
+    df = df.where(nans_mask == False, other=np.nan)
+    return df
+
+
+def df_fill_first_nan_by_cross_median(df: pd.DataFrame,
+                                      is_replace_zeros: bool = True
+                                      ) -> pd.DataFrame:
+    """
+    before first non nan use median of other columns
+    after that use ffill
+    """
+    df = df.copy()
+    if is_replace_zeros:
+        df = df.replace(0.0, np.nan)
+
+    # for each column find first nonan
+    first_nonnan_index = get_nonnan_index(df)
+    merged_data = pd.DataFrame(index=df.index, columns=df.columns)
+    for idx, column in enumerate(df.columns):
+        its_first_nonnan_index = first_nonnan_index[idx]
+        with warnings.catch_warnings():  # silence All-NaN slice encountered
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            median_backfill = np.nanmedian(df.loc[:its_first_nonnan_index, :].to_numpy(), axis=1)
+        merged_data.loc[:its_first_nonnan_index, column] = median_backfill
+        merged_data.loc[its_first_nonnan_index:, column] = df.loc[its_first_nonnan_index:, column].to_numpy()
+
+    # fillnans with ffill in data after
+    merged_data = merged_data.infer_objects(copy=False).ffill()
+
+    return merged_data

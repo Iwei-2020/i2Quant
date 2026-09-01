@@ -1,0 +1,1054 @@
+"""
+time windows, date schedules and rebalancing calendars: the date layer the rest of qis calls.
+
+``TimePeriod`` is the canonical window - a start, an end and a tz - and ``time_period.locate(df)``
+is how a frame is sliced anywhere in the stack. Masking an index by hand instead is the thing
+this class exists to prevent: ``locate`` applies one inclusive convention everywhere, and the tz
+travels with the period so a tz-aware frame is never silently compared against naive timestamps.
+Either bound may be None for an open-ended side, and both accept pd.Timestamp, datetime, str,
+int or an Enum wrapping one of those.
+
+``generate_dates_schedule`` turns a window and a frequency into a tz-aware index. Beyond the
+pandas offset aliases ('B', 'W-WED', 'ME', 'QE') it recognises four bespoke frequencies:
+``'SE'`` for the endpoints only, ``'M-FRI'`` and ``'Q-FRI'`` for the last Friday of a month or
+quarter, ``'Q-3FRI'`` for the third Friday of the quarter's last month - the listed-derivative
+expiry - and the ``'<freq>_<n>H'`` form for a schedule anchored to an intraday fixing.
+
+``generate_rebalancing_indicators`` is the step that matters for a backtest. It builds the
+schedule, then marks each *observation* date on or after a scheduled date, so rebalancing lands
+on dates the data actually has rather than on a calendar date that fell on a holiday. Its
+boolean series is the ``is_rebalancing`` input the backtester consumes;
+``create_rebalancing_indicators_from_freqs`` does the same per ticker when instruments rebalance
+on different calendars, and ``num_warmup_periods`` holds the first rebalancing back until an
+estimator has data.
+
+``FreqMap`` maps a frequency alias to a caption and to business- and calendar-day counts. Those
+counts are period lengths, not annualisation factors: periods per year come from
+``qis/utils/annualisation.py``, which reads the frequency string or infers it from an index.
+
+Also here: ``generate_sample_dates`` and ``split_df_by_freq`` for overlapping windows, and
+``generate_fixed_maturity_rolls`` for the roll schedule of a fixed-maturity instrument.
+"""
+
+from __future__ import annotations  # to allow class method annotations
+
+from bisect import bisect_right
+import warnings
+import datetime as dt
+import re
+import pandas as pd
+import numpy as np
+from typing import List, Union, Tuple, Optional, NamedTuple, Dict, cast
+from enum import Enum
+
+from qis.utils.struct_ops import separate_number_from_string
+
+DATE_FORMAT = '%d%b%Y'  # 31Jan2020 - common across all reporting
+DATE_FORMAT_INT = '%Y%m%d'  # 20000131
+
+WEEKDAYS: List[str] = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+
+def get_current_time_with_tz(tz: Optional[str] = 'UTC',
+                             days_offset: int = None,
+                             normalize: bool = True,
+                             hour: int = None
+                             ) -> pd.Timestamp:
+    t = pd.Timestamp.today(tz=tz)
+    if normalize:
+        t = t.normalize()  # normalize to eod date
+    if days_offset is not None:
+        t = t + pd.Timedelta(days=days_offset)
+    if hour is not None:
+        t = t.replace(hour=hour)
+    return t
+
+
+def get_time_to_maturity(maturity_time: pd.Timestamp,
+                         value_time: pd.Timestamp,
+                         is_floor_at_zero: bool = True,
+                         annualization_factor: float = 365
+                         ) -> float:
+    """
+    return annualised difference between mat_date and value_time
+    """
+    seconds_per_year = annualization_factor * 24 * 60 * 60  # days, hours, minute, seconds
+    ttm = (maturity_time - value_time).total_seconds() / seconds_per_year
+    if is_floor_at_zero and ttm < 0.0:
+        ttm = 0.0
+    return ttm
+
+
+class FreqData(NamedTuple):
+    """
+    enumerate frequencies with caption, python alias and set n_bus and calendar days
+    in applications we need to set a number of calendar and business days for each frequency
+    """
+    cap: str
+    freq_cap: str
+    n_bus: Union[int, float]
+    n_cal: Union[int, float]
+
+    def print(self):
+        print(f"{self.cap}, {self.freq_cap}, n_bus={self.n_bus}, n_cal={self.n_cal}")
+
+    def to_n_bus_days(self):
+        return self.n_bus
+
+    def to_caption(self):
+        return self.cap
+
+    def to_freq_cap(self):
+        return self.freq_cap
+
+
+class FreqMap(FreqData, Enum):
+    """
+    name is linked to python aliases, value have extra data
+    """
+    B = FreqData('day', 'daily', 1, 1)
+    D = FreqData('day', 'daily', 1, 1)
+    W = FreqData('week', 'weekly', 5, 7)
+    W2 = FreqData('bi-week', 'bi-weekly', 10, 14)
+    M = FreqData('month', 'monthly', 21, 31)
+    M2 = FreqData('bi-month', 'bi-monthly', 42, 62)
+    BM = FreqData('month', 'monthly', 21, 31)
+    Q = FreqData('quarter', 'quarterly', 63, 93)
+    BQ = FreqData('quarter', 'quarterly', 63, 93)
+    Q2 = FreqData('bi-quarter', 'bi-quarterly', 126, 180)
+    BQ2 = FreqData('bi-quarter', 'bi-quarterly', 126, 180)
+    A = FreqData('year', 'annual', 252, 360)
+
+    def to_freq(self) -> str:
+        if self.name == 'W2':
+            freq = '2W'
+        elif self.name == 'M2':
+            freq = '2M'
+        elif self.name == 'Q2':
+            freq = '2Q'
+        elif self.name == 'BQ2':
+            freq = '2BQ'
+        else:
+            freq = self.name
+        return freq
+
+    @classmethod
+    def to_value(cls, freq: str = 'B') -> FreqData:
+        if freq == '2W':
+            freq = 'W2'
+        elif freq == '2M':
+            freq = 'M2'
+        elif freq == '2Q':
+            freq = 'Q2'
+        elif freq == '2BQ':
+            freq = 'BQ2'
+        return cls.map_to_value(freq)
+
+    @classmethod
+    def map_to_value(cls, name):
+        """
+        given name return value
+        """
+        for k, v in cls.__members__.items():
+            if k == name:
+                return v
+        raise ValueError(f"nit in enum {name}")
+
+    @classmethod
+    def map_n_days(cls, n_days):
+        for freq in cls:
+            if freq.n_cal == n_days:
+                return freq
+        raise ValueError(f"cannot map {n_days}")
+
+
+class TimePeriod:
+    """
+    a start and end date, with the conversions and slicing every qis function expects.
+
+    The canonical way to express a window in this stack. Pass a TimePeriod rather than masking
+    an index by hand: ``time_period.locate(df)`` applies the same inclusive convention
+    everywhere, and the tz is carried with the period so a tz-aware frame is not silently
+    compared against naive timestamps.
+
+    Either bound may be None, meaning open-ended on that side. ``start`` and ``end`` accept
+    pd.Timestamp, datetime, str, int, or an Enum whose value is one of those:
+
+    - ``'12/31/2019'`` — month/day/year
+    - ``'31Dec2019'``
+    - ``20191231`` as a string — year/month/day
+    - ``2019`` as an int — 1 January of that year
+
+    Args:
+        start: start of the window, or None for open-ended
+        end: end of the window, or None for open-ended
+        tz: timezone applied to both bounds
+
+    Raises:
+        TypeError: if a bound is of a type not listed above
+    """
+
+    SUPPORTED_TYPES = Union[pd.Timestamp, str, dt.datetime, Enum, int]
+
+    def __init__(self,
+                 start: SUPPORTED_TYPES = None,
+                 end: SUPPORTED_TYPES = None,
+                 tz: str = None):
+
+        # internal data
+        self.start: Optional[pd.Timestamp]
+        self.end: Optional[pd.Timestamp]
+
+        if start is not None:
+            if isinstance(start, str):  # most expected
+                self.start = pd.Timestamp(start)
+            elif isinstance(start, pd.Timestamp):  # 2nd most expected
+                self.start = start
+            elif isinstance(start, dt.datetime):
+                self.start = pd.Timestamp(start)
+            elif isinstance(start, Enum):  # enum of type string or pd.Timestamp can be used
+                self.start = pd.Timestamp(start.value)
+            elif isinstance(start, int):  # year is passed
+                self.start = pd.Timestamp(dt.datetime(year=start, month=1, day=1))
+            else:
+                raise TypeError(f"unsuported type for date {start} of {type(start)}")
+        else:
+            self.start = None
+
+        if end is not None:
+            if isinstance(end, str):  # most expected
+                self.end = pd.Timestamp(end)
+            elif isinstance(end, pd.Timestamp):  # send most expected
+                self.end = end
+            elif isinstance(end, dt.datetime):
+                self.end = pd.Timestamp(end)
+            elif isinstance(end, Enum):  # enum of type string can be used
+                self.end = pd.Timestamp(end.value)
+            elif isinstance(end, int):  # year is passed
+                self.end = pd.Timestamp(dt.datetime(year=end, month=1, day=1))
+            else:
+                raise TypeError(f"unsuported type for date {end} of {type(end)}")
+        else:
+            self.end = None
+
+        self.tz = tz
+        if tz is not None:
+            self.start, self.end = tz_localize_dates(start_date=self.start, end_date=self.end, tz=tz)
+
+    def print(self) -> None:
+        print(f"start={self.start}, end={self.end}")
+
+    def copy(self) -> TimePeriod:
+        return TimePeriod(start=self.start, end=self.end)
+
+    def tz_localize(self, tz: str = 'UTC') -> TimePeriod:
+        start, end = tz_localize_dates(start_date=self.start, end_date=self.end, tz=tz)
+        return TimePeriod(start, end)
+
+    def to_str(self,
+               date_separator: str = ' - ',
+               is_increase_by_one_day: bool = False,
+               date_format: Optional[str] = DATE_FORMAT
+               ) -> str:
+        if self.start is not None:
+            if is_increase_by_one_day:
+                start_date_str = shift_date_by_day(self.start, backward=False).strftime(date_format)
+            else:
+                start_date_str = self.start.strftime(date_format)
+        else:
+            start_date_str = ''
+
+        if self.end is not None:
+            end_date_str = self.end.strftime(date_format)
+        else:
+            end_date_str = ''
+
+        label = f"{start_date_str}{date_separator}{end_date_str}"
+        return label
+
+    def start_to_str(self, format: Optional[str] = DATE_FORMAT) -> str:
+        if format is None:
+            start_str = str(self.start.year)
+        else:
+            start_str = self.start.strftime(format)
+        return start_str
+
+    def end_to_str(self, format: Optional[str] = DATE_FORMAT) -> str:
+        end_date = self.end or dt.date.today()
+        if format is None:
+            end_str = str(end_date.year)
+        else:
+            end_str = end_date.strftime(format)
+        return end_str
+
+    def locate(self, df: Union[pd.DataFrame, pd.Series]) -> Union[pd.DataFrame, pd.Series]:
+        """
+        truncate timeseries data to given timeperiod
+        """
+        if not (isinstance(df, pd.DataFrame) or isinstance(df, pd.Series)):
+            raise NotImplementedError(f"type(df)={type(df)}")
+        if isinstance(df.index, pd.DatetimeIndex):
+            tz = df.index.tz
+            if tz is not None:
+                time_period = self.tz_localize(tz=tz)
+                start, end = time_period.start, time_period.end
+            else:
+                start, end = self.start, self.end
+            if start is not None and start < df.index[0]:  # restrict
+                start = df.index[0]
+            if end is not None and end > df.index[-1]:
+                end = df.index[-1]
+            df = df.loc[start:end]
+        else:
+            pass
+            # print(f"df index type is {type(df.index)}")
+        return df
+
+    def fill_outside(self,
+                     df: Union[pd.DataFrame, pd.Series],
+                     fill_value: float = np.nan
+                     ) -> Union[pd.DataFrame, pd.Series]:
+        """
+        fill given value outside of timeperiod
+        """
+        if isinstance(df.index, pd.DatetimeIndex):
+            tz = df.index.tz
+            if tz is not None:
+                time_period = self.tz_localize(tz=tz)
+                start, end = time_period.start, time_period.end
+            else:
+                start, end = self.start, self.end
+            if start is not None:
+                df.loc[:start] = fill_value
+            if end is not None:
+                df.loc[end:] = fill_value
+        else:
+            pass
+            # print(f"df index type is {type(df.index)}")
+        return df
+
+    def to_pd_datetime_index(self,
+                             freq: str = 'B',
+                             hour_offset: Optional[int] = None,
+                             tz: Optional[str] = None,
+                             include_start_date: bool = False,
+                             include_end_date: bool = False,
+                             is_business_dates: bool = True,
+                             days_shift: Optional[int] = None
+                             ) -> pd.DatetimeIndex:
+        """
+        generate pd dt_time index
+        """
+        sed = self.copy()
+        sed.tz = tz
+        if days_shift is not None:
+            sed.end = shift_date_by_day(sed.end, num_days=days_shift, backward=False)
+        pd_datetime_index = generate_dates_schedule(sed, freq=freq, hour_offset=hour_offset,
+                                                    include_start_date=include_start_date,
+                                                    include_end_date=include_end_date,
+                                                    is_business_dates=is_business_dates)
+        return pd_datetime_index
+
+    def to_period_dates_str(self,
+                            freq: str = 'B',
+                            tz: Optional[str] = None,
+                            date_format: str = '%Y%m%d',
+                            holidays: pd.DatetimeIndex = None
+                            ) -> List[str]:
+        """
+        nb. can pass calendar
+        pd.date_range(holidays=holidays)
+        """
+        dates = self.to_pd_datetime_index(freq=freq, tz=tz)
+        date_strs = pd.Series(dates).apply(lambda x: x.strftime(date_format)).to_list()
+        return date_strs
+
+    def shift_end_date_by_days(self, backward: bool = True, num_days: int = 1) -> TimePeriod:
+        return TimePeriod(start=self.start,
+                          end=shift_date_by_day(self.end, backward=backward, num_days=num_days))
+
+    def shift_start_date_by_days(self, backward: bool = False, num_days: int = 1) -> TimePeriod:
+        return TimePeriod(start=shift_date_by_day(self.start, backward=backward, num_days=num_days),
+                          end=self.end)
+
+    def get_time_period_an(self) -> float:  # annualised time period
+        return get_time_to_maturity(maturity_time=self.end or pd.Timestamp.today(tz=self.tz),
+                                    value_time=self.start)
+
+
+def truncate_prior_to_start(df: Union[pd.DataFrame, pd.Series],
+                            start: pd.Timestamp
+                            ) -> Union[pd.DataFrame, pd.Series]:
+    """
+    slice from ``start``, keeping the last observation before it when ``start`` is not an index
+    entry.
+
+    A plain ``df.loc[start:]`` drops the observation before ``start``, and for a price series that
+    loses the level the first return is computed against - the truncated series then has one fewer
+    return than it should. This keeps that anchor row.
+
+    Args:
+        df: frame or series with a sorted date index
+        start: first date to keep. A date before the history returns the complete input. When a
+            date within the history is not in the index, the last entry before it is prepended
+
+    Returns:
+        the truncated data, in the same type as the input
+
+    Raises:
+        NotImplementedError: if ``df`` is neither a DataFrame nor a Series
+    """
+    if isinstance(df, pd.DataFrame):
+        df_ = df.loc[start:, :]
+        if df_.index[0] != start:
+            df_before = df.loc[:start, :]
+            if not df_before.index.empty:
+                # take last row before cutoff date
+                row_before = df_before.iloc[-1, :].to_frame().T
+                df_ = pd.concat([row_before, df_], axis=0)
+
+    elif isinstance(df, pd.Series):
+        df_ = df.loc[start:]
+        if df_.index[0] != start:
+            ds_before = df.loc[:start]
+            if not ds_before.index.empty:
+                # take last row before cutoff date
+                row_before = ds_before.iloc[[-1]]
+                df_ = pd.concat([row_before, df_], axis=0)
+    else:
+        raise NotImplementedError(f"{type(df)}")
+    return df_
+
+
+def get_time_period(df: Union[pd.Series, pd.DataFrame] = None,
+                    index: pd.DatetimeIndex = None,
+                    tz: str = None
+                    ) -> TimePeriod:
+    """
+    the TimePeriod spanned by a frame's index, or by an index directly.
+
+    ``TimePeriod`` is the house type for a date range, so this is the entry point that turns data
+    into one. The timezone is inherited from the index unless ``tz`` overrides it, which keeps a
+    localised panel from silently losing its zone downstream.
+
+    Args:
+        df: frame or series whose index defines the period. Takes precedence over ``index``
+        index: index to read instead, when there is no frame to hand
+        tz: timezone for the result. None inherits the index timezone
+
+    Returns:
+        the period from the first to the last index entry, or an empty TimePeriod on an empty index
+
+    Raises:
+        ValueError: if neither ``df`` nor ``index`` is given
+    """
+    if df is not None:
+        index = df.index
+    else:
+        if index is None:
+            raise ValueError(f"must pass either df or index")
+    # if not isinstance(index, pd.DatetimeIndex):
+    #    raise ValueError(f"index must be type of pd.DatetimeIndex not of {type(index)}")
+    if len(index) > 0:
+        output = TimePeriod(start=index[0], end=index[-1], tz=tz or index.tz)
+    else:
+        output = TimePeriod()
+    return output
+
+
+def get_time_period_label(data: pd.DataFrame,
+                          date_separator: str = ':',
+                          is_increase_by_one_day: bool = False,
+                          date_format: str = DATE_FORMAT
+                          ) -> str:
+    """
+    the date range of a frame's index, formatted for a chart title or a table header.
+
+    Args:
+        data: frame whose first and last index entries bound the label
+        date_separator: string between the two dates
+        is_increase_by_one_day: add a day to the end date. Use it where the period is quoted with
+            an exclusive end, so that a month-end panel reads to the first of the next month
+        date_format: strftime format for both dates
+
+    Returns:
+        the formatted range, e.g. ``31Dec2019:31Dec2024``
+    """
+    time_period = TimePeriod(start=data.index[0], end=data.index[-1])
+    time_period_label = time_period.to_str(date_format=date_format,
+                                           date_separator=date_separator,
+                                           is_increase_by_one_day=is_increase_by_one_day)
+    return time_period_label
+
+
+def get_time_period_shifted_by_years(time_period: TimePeriod,
+                                     n_years: int = 1,
+                                     backward: bool = True
+                                     ) -> TimePeriod:
+    end_date = time_period.end
+    if end_date is not None:
+        start_date = shift_dates_by_n_years(dates=end_date, n_years=n_years, backward=backward)
+        time_period = TimePeriod(start_date, end_date)
+    else:
+        time_period = time_period
+    return time_period
+
+
+def get_ytd_time_period(year: Optional[int] = None,
+                        tz: Optional[str] = None,
+                        days_offset: Optional[int] = -1,
+                        normalize: bool = True
+                        ) -> TimePeriod:
+    end = get_current_time_with_tz(tz=tz, days_offset=days_offset, normalize=normalize)
+    if year is None:
+        year = end.year
+    return TimePeriod(start=dt.datetime(year=year-1, month=12, day=31), end=end)
+
+
+def generate_dates_schedule(time_period: TimePeriod,
+                            freq: str = 'ME',
+                            hour_offset: Optional[int] = None,
+                            include_start_date: bool = False,
+                            include_end_date: bool = False,
+                            is_business_dates: bool = True
+                            ) -> pd.DatetimeIndex:
+    """
+    tz-aware schedule of dates spanning a time period at a given frequency.
+
+    The returned index carries the tz of ``time_period``. Beyond the pandas offset aliases,
+    four bespoke frequencies are recognised:
+
+    - ``'SE'``: the start and end dates only
+    - ``'M-FRI'`` / ``'Q-FRI'``: the last Friday of each month / quarter
+    - ``'Q-3FRI'``: the third Friday of the last month of each quarter, the listed-derivative
+      expiry convention
+    - ``'<freq>_<n>H'``, for example ``'D_8H'``: ``freq`` shifted by ``n`` hours, for schedules
+      anchored to an intraday fixing
+
+    Args:
+        time_period: window to span; ``time_period.end`` is required
+        freq: pandas offset alias ('ME', 'QE', 'W-WED', 'B', 'h') or one of the bespoke
+            frequencies above
+        hour_offset: hours added to every date after the schedule is built; ignored for the
+            ``'<freq>_<n>H'`` form, which sets its own offset
+        include_start_date: prepend ``time_period.start`` when the first scheduled date is
+            later than it
+        include_end_date: append ``time_period.end`` when the last scheduled date is earlier
+            than it. The Friday and underscore frequencies drop their final date when this is
+            False, so that the schedule does not run past the period
+        is_business_dates: build on ``pd.bdate_range`` rather than ``pd.date_range``
+
+    Returns:
+        schedule of dates; empty only if the period admits no date and neither
+        ``include_start_date`` nor ``include_end_date`` is set
+
+    Raises:
+        ValueError: if ``time_period.end`` is None
+    """
+    if freq == 'SE':  # simple start end
+        dates_schedule = pd.DatetimeIndex(data=[time_period.start, time_period.end], tz=time_period.tz)
+        return dates_schedule
+
+    end_date = time_period.end
+    if end_date is None:
+        raise ValueError(f"end_date must be given")
+    is_24_hour_offset = False
+    if freq == 'h':  # need to do offset so the end of the day will be at 22:00:00 end date
+        if end_date.hour == 0:
+            is_24_hour_offset = True
+        end_date = time_period.end + pd.offsets.Hour(24)
+
+    def create_range(freq_: str, tz: Optional[str] = time_period.tz) -> pd.DatetimeIndex:
+        if is_business_dates:
+            return pd.bdate_range(start=time_period.start,
+                                  end=end_date,
+                                  freq=freq_,
+                                  tz=tz)
+        else:
+            return pd.date_range(start=time_period.start,
+                                 end=end_date,
+                                 freq=freq_,
+                                 tz=tz)
+
+    if freq == 'M-FRI':  # last friday of month
+        # create weekly fridays
+        dates_schedule1 = create_range(freq_='W-FRI', tz=time_period.tz)
+        dates_schedule2 = create_range(freq_='ME', tz=time_period.tz)
+        # filter last Friday per month periods
+        dates_schedule = pd.Series(dates_schedule1, index=dates_schedule1).reindex(index=dates_schedule2, method='ffill').dropna()
+        dates_schedule = pd.DatetimeIndex(dates_schedule.to_numpy())  # back to DatetimeIndex type
+        if include_end_date is False:
+            dates_schedule = dates_schedule[:-1]
+
+    elif freq == 'Q-FRI':  # last friday of quarter
+        # create weekly fridays
+        dates_schedule1 = create_range(freq_='W-FRI', tz=time_period.tz)
+        dates_schedule2 = create_range(freq_='QE', tz=time_period.tz)
+        # filter last Friday per quarter periods
+        dates_schedule = pd.Series(dates_schedule1, index=dates_schedule1).reindex(index=dates_schedule2, method='ffill').dropna()
+        dates_schedule = pd.DatetimeIndex(dates_schedule.to_numpy())  # back to DatetimeIndex type
+        if include_end_date is False:
+            dates_schedule = dates_schedule[:-1]
+
+    elif freq == 'Q-3FRI':  # last friday of quarter
+        # create monthly 3rd fridays
+        dates_schedule1 = create_range(freq_='WOM-3FRI', tz=time_period.tz)
+        dates_schedule2 = create_range(freq_='QE', tz=time_period.tz)
+        # filter last Friday per quarter periods
+        dates_schedule = pd.Series(dates_schedule1, index=dates_schedule1).reindex(index=dates_schedule2, method='ffill').dropna()
+        dates_schedule = pd.DatetimeIndex(dates_schedule.to_numpy())  # back to DatetimeIndex type
+        if include_end_date is False:
+            dates_schedule = dates_schedule[:-1]
+
+    elif '_' in freq:
+        # support for bespoke D_8H  # daily at 8H utc
+        ss = freq.split('_')
+        freq = ss[0]
+        hour_offset = int(re.findall(r'\d+', ss[-1])[0])
+        dates_schedule1 = create_range(freq_=freq, tz=time_period.tz)
+        dates_schedule = pd.DatetimeIndex([x + pd.DateOffset(hours=hour_offset) for x in dates_schedule1])
+        if include_end_date is False:
+            dates_schedule = dates_schedule[:-1]
+
+    else:
+        dates_schedule = create_range(freq_=freq)
+
+    # handle case when nothing is in
+    if len(dates_schedule) == 0:
+        if include_start_date and include_end_date:
+            dates_schedule = pd.DatetimeIndex([time_period.start, time_period.end])
+        elif include_start_date:
+            dates_schedule = pd.DatetimeIndex([time_period.start])
+        elif include_end_date:
+            dates_schedule = pd.DatetimeIndex([time_period.end])
+    elif freq == 'h':
+        dates_schedule = dates_schedule[dates_schedule >= time_period.start]
+        if is_24_hour_offset:
+            dates_schedule = dates_schedule[:-1]  # drop the next dat at 00:00:00
+        else:
+            dates_schedule = dates_schedule[dates_schedule <= time_period.end]
+        if include_end_date and dates_schedule[-1] < time_period.end:  # append date scedule with last elemnt
+            dates_schedule = dates_schedule.append(pd.DatetimeIndex([time_period.end]))
+    else:
+        # hour offset should not be beyond the end period
+        if hour_offset is not None:
+            dates_schedule = pd.DatetimeIndex([x + pd.DateOffset(hours=hour_offset) for x in dates_schedule])
+
+        if include_start_date:  # irrespective of hour offset
+            # if hour_offset is not None:
+            #    this_start = time_period.start + pd.DateOffset(hours=hour_offset)
+            # else:
+            this_start = time_period.start
+            if dates_schedule[0] > this_start:
+                # create start date and append the dates schedule
+                dates_schedule = (pd.DatetimeIndex([this_start])).append(dates_schedule)
+
+        if include_end_date:
+            # if hour_offset is not None:
+            #    this_end = time_period.end + pd.DateOffset(hours=hour_offset)
+            # else:
+            this_end = time_period.end
+            if dates_schedule[-1] < this_end:  # append date scedule with last elemnt
+                dates_schedule = dates_schedule.append(pd.DatetimeIndex([this_end]))
+
+    return dates_schedule
+
+
+def generate_rebalancing_indicators(df: Union[pd.DataFrame, pd.Series] = None,
+                                    index: pd.DatetimeIndex = None,
+                                    freq: str = 'ME',
+                                    include_start_date: bool = False,
+                                    include_end_date: bool = False,
+                                    num_warmup_periods: Optional[int] = None,
+                                    return_true_only: bool = False
+                                    ) -> pd.Series:
+    """
+    boolean rebalancing flags aligned to an observation index.
+
+    Builds a schedule at ``freq`` over the span of the index, then marks each observation date
+    on or after a scheduled date. The result is the ``is_rebalancing`` input the backtester
+    expects, so rebalancing happens on dates the data actually has rather than on calendar
+    dates that may fall on a holiday.
+
+    Args:
+        df: frame or series whose index defines the observation dates; ignored if ``index``
+            is given
+        index: observation dates, as an alternative to ``df``
+        freq: rebalancing frequency, passed to :func:`generate_dates_schedule`
+        include_start_date: mark the first observation as a rebalancing date
+        include_end_date: mark the last observation as a rebalancing date
+        num_warmup_periods: number of leading observations forced to False, so an estimator
+            has data before the first rebalancing
+        return_true_only: return only the True entries rather than a flag per observation
+
+    Returns:
+        boolean series indexed as the observations, or only its True entries when
+        ``return_true_only``
+
+    Raises:
+        ValueError: if neither ``df`` nor ``index`` is given
+        NotImplementedError: if ``df`` is neither pd.Series nor pd.DataFrame
+    """
+    if df is not None:
+        if not (isinstance(df, pd.Series) or isinstance(df, pd.DataFrame)):
+            raise NotImplementedError(f"type={type(df)}")
+        index = df.index
+    else:
+        if index is None:
+            raise ValueError(f"must pass either df or index")
+
+    dates_schedule = generate_dates_schedule(time_period=get_time_period(index=index),
+                                             freq=freq,
+                                             include_start_date=include_start_date,
+                                             include_end_date=include_end_date)
+    indicators_full = set_rebalancing_timeindex_on_given_timeindex(given_index=index, rebalancing_index=dates_schedule)
+    if num_warmup_periods is not None:
+        indicators_full.iloc[:num_warmup_periods] = False
+    if return_true_only:
+        indicators_full = indicators_full.loc[indicators_full == True]
+    return indicators_full
+
+
+def set_rebalancing_timeindex_on_given_timeindex(given_index: pd.DatetimeIndex,
+                                                 rebalancing_index: pd.DatetimeIndex
+                                                 ) -> pd.Series:
+    """
+    place rebalancing pd.DatetimeIndex on available or next valin
+    """
+    all_dates_indicators = pd.Series(data=True, index=rebalancing_index)  # all indicators
+    # on time grid
+    indicators_on_grid = all_dates_indicators.reindex(index=given_index).dropna()
+    # off time grid
+    indicators_off_grid = all_dates_indicators.iloc[np.isin(all_dates_indicators.index, indicators_on_grid.index) == False]
+    next_dates_off_grid = pd.Series(given_index, index=given_index).reindex(index=indicators_off_grid.index, method='bfill')
+    indicators_off_grid = pd.Series(data=True, index=next_dates_off_grid.to_numpy())
+    if not indicators_off_grid.empty:
+        indicators_on_grid = pd.concat([indicators_on_grid, indicators_off_grid], axis=0).sort_index()
+    else:
+        indicators_on_grid = indicators_on_grid.sort_index()
+    indicators_full = pd.Series(data=np.where(np.isin(given_index, indicators_on_grid.index), True, False), index=given_index)
+    return indicators_full
+
+
+def generate_sample_dates(time_period: TimePeriod,
+                          freq: str = 'ME',
+                          overlap_frequency: str = None,
+                          include_start_date: bool = False,
+                          include_end_date: bool = False
+                          ) -> pd.DataFrame:
+    """
+    generate df with columns [start, end]
+    """
+    # generate end dates: DatetimeIndex
+    end_dates = generate_dates_schedule(time_period=time_period,
+                                        freq=freq,
+                                        include_start_date=include_start_date,
+                                        include_end_date=include_end_date)
+    # convert to datetime.datetime
+    py_end_dates = end_dates.to_pydatetime()
+
+    # TODO: add if include first date
+    # TODO: when start_N and end date_N-1 are non-overlaping
+    if overlap_frequency is None:  # StartDate_N =  EndDate_{N-1}
+        start_dates = py_end_dates[:-1]  # from 0 up to last-1
+        end_dates = py_end_dates[1:]  # from 1 up to last
+        sample_dates = pd.DataFrame({'start': start_dates, 'end': end_dates}, index=end_dates)
+
+    elif overlap_frequency == 'YE':
+        start_dates = shift_dates_by_year(end_dates, backward=True)  # from 0 up to last-1
+        end_dates = py_end_dates  # from 1 up to last
+        # cut dates before start date
+        sample_dates = pd.DataFrame({'start': start_dates, 'end': end_dates}, index=end_dates)
+        sample_dates = sample_dates[sample_dates['start'] > time_period.start]
+
+    # frequncy of type 1A, 2A, 3A,...
+    elif list(overlap_frequency)[-1] == 'YE':
+        n_years = int(separate_number_from_string(overlap_frequency)[0])
+        start_dates = shift_dates_by_n_years(dates=end_dates, n_years=n_years, backward=True)
+        end_dates = py_end_dates  # from 1 up to last
+        # cut dates before start date
+        sample_dates = pd.DataFrame({'start': start_dates, 'end': end_dates}, index=end_dates)
+        sample_dates = sample_dates[sample_dates['start'] > time_period.start]
+    else:
+        raise TypeError(f"overlap_frequency={overlap_frequency} is not implemented")
+
+    return sample_dates
+
+
+def is_leap_year(year: int) -> bool:
+    """
+    Check if the int given year is a leap year
+    return true if leap year or false otherwise
+    """
+    if (year % 4) == 0:
+        if (year % 100) == 0:
+            if (year % 400) == 0:
+                return True
+            else:
+                return False
+        else:
+            return True
+    else:
+        return False
+
+
+def get_weekday(dates: Union[pd.DatetimeIndex, pd.Index]) -> List[str]:
+    weekdays = [WEEKDAYS[date.weekday()] for date in dates]
+    return weekdays
+
+
+def get_year_quarter(dates: list, date_format: str = 'Q%d-%d') -> List[str]:
+    year_quarter = [date_format % (np.ceil(date.month / 3), date.year) for date in dates]
+    return year_quarter
+
+
+def shift_date_by_day(date: pd.Timestamp, backward: bool = True, num_days: int = 1) -> pd.Timestamp:
+    if backward:
+        date1 = date - pd.offsets.Day(num_days)
+    else:
+        date1 = date + pd.offsets.Day(num_days)
+
+    return date1
+
+
+def shift_dates_by_year(dates: Union[pd.Timestamp, pd.DatetimeIndex],
+                        backward: bool = True
+                        ) -> Union[pd.Timestamp, pd.DatetimeIndex]:
+    """
+    shift dates by 365 for non leap year and 366 for leap year
+    """
+    if isinstance(dates, pd.Timestamp):
+        dates1 = [dates]
+    else:
+        dates1 = dates
+
+    shifted_dates = []
+    for date in dates1:
+        if is_leap_year(date.year):
+            delta = dt.timedelta(days=366)
+        else:
+            delta = dt.timedelta(days=365)
+
+        if backward:
+            delta = -delta
+
+        shifted_dates.append(date + delta)
+
+    if isinstance(dates, pd.Timestamp):
+        shifted_dates = shifted_dates[0]
+
+    return shifted_dates
+
+
+def shift_dates_by_n_years(dates: Union[pd.Timestamp, pd.DatetimeIndex],
+                           n_years: int = 1,
+                           backward: bool = True
+                           ) -> Union[pd.Timestamp, pd.DatetimeIndex]:
+
+    shifted_dates = dates
+    for n in range(1, n_years+1):
+        shifted_dates = shift_dates_by_year(shifted_dates, backward=backward)
+    return shifted_dates
+
+
+def tz_localize_dates(start_date: pd.Timestamp,
+                      end_date: pd.Timestamp,
+                      tz: str = 'UTC'
+                      ) -> Tuple[pd.Timestamp, pd.Timestamp]:
+
+    if start_date is not None and start_date.tz is None:
+        start = start_date.tz_localize(tz)
+    else:
+        start = start_date
+    if end_date is not None and end_date.tz is None:
+        end = end_date.tz_localize(tz)
+    else:
+        end = end_date
+    return start, end
+
+
+def split_df_by_freq(df: pd.DataFrame,
+                     freq: str = 'ME',
+                     overlap_frequency: str = None,
+                     include_start_date: bool = True,
+                     include_end_date: bool = True
+                     ) -> Dict[pd.Timestamp, pd.DataFrame]:
+    """
+    take pandas data sampled at some freq and split into lower freq
+    one caveat: the correct date of he split must be last day of sample_dates
+    for consistency wih different calenders
+    get sample start end dates as data
+    """
+    time_period = TimePeriod(start=df.index[0], end=df.index[-1])
+    sample_dates = generate_sample_dates(time_period=time_period,
+                                         freq=freq,
+                                         overlap_frequency=overlap_frequency,
+                                         include_start_date=include_start_date,
+                                         include_end_date=include_end_date)
+    df_split = {}
+    for start, end in zip(sample_dates['start'], sample_dates['end']):
+        df_split[end] = df[start:end]
+    return df_split
+
+
+def get_sample_dates_idx(population_dates: pd.Index, sample_dates: pd.Index) -> List[int]:
+    """
+    get indixes of data sample
+    """
+    # use series indexs at population_dates
+    pd_population_dates = pd.Series(population_dates, index=population_dates, name='population_dates')
+
+    # sampled_population data will have last available dates in population_dates matched to the index population_dates
+    sampled_population = pd_population_dates.reindex(index=sample_dates, method='ffill')
+
+    # reset index will be idx of pd_population_dates masked with cond
+    cond = np.isin(population_dates, sampled_population, assume_unique=True)
+    sample_dates_idx = pd_population_dates.reset_index().loc[cond].index.to_list()
+    return sample_dates_idx
+
+
+def generate_fixed_maturity_rolls(time_period: TimePeriod,
+                                  freq: str = 'h',
+                                  roll_freq: str = 'W-FRI',
+                                  roll_hour: Optional[int] = 8,
+                                  min_days_to_next_roll: int = 6,
+                                  include_end_date: bool = False,
+                                  future_days_offset: int = 360
+                                  ) -> pd.Series:
+    """
+    the roll schedule of a fixed-maturity instrument: for each observation time, the expiry held.
+
+    A constant-maturity series is a sequence of contracts, and this says which one is held when.
+    The roll happens once the current expiry is closer than ``min_days_to_next_roll``, so the
+    position is never carried into the last days before expiry where liquidity thins.
+
+    Args:
+        time_period: period over which to generate the schedule
+        freq: frequency of the observation times, as a pandas offset alias
+        roll_freq: frequency of the candidate expiries, e.g. ``'W-FRI'`` for weekly Friday expiries
+        roll_hour: hour of day of the expiry. None leaves it at midnight
+        min_days_to_next_roll: roll once the held expiry is fewer than this many days away
+        include_end_date: include the end of ``time_period`` in the observation times
+        future_days_offset: how far past the end of the period to generate candidate expiries, so
+            that the observations near the end still have a next contract to roll into
+
+    Returns:
+        the expiry held at each observation time, indexed by observation time
+    """
+    observation_times = generate_dates_schedule(time_period,
+                                                freq=freq,
+                                                include_start_date=True,
+                                                include_end_date=include_end_date)
+    # use large day shift to cover at least next quarter
+    roll_days = generate_dates_schedule(time_period.shift_end_date_by_days(num_days=future_days_offset, backward=False),
+                                        freq=roll_freq,
+                                        hour_offset=roll_hour)
+
+    if len(roll_days) == 1:
+        roll_schedule = pd.Series(roll_days[0], index=observation_times)
+    else:
+        roll_schedule = {}
+        starting_roll_idx = 0
+        next_roll = roll_days[starting_roll_idx]
+        for observed_time in observation_times:
+            diff = (next_roll - observed_time).days
+            if diff < min_days_to_next_roll:
+                if starting_roll_idx + 1 < len(roll_days):
+                    starting_roll_idx += 1
+                    next_roll = roll_days[starting_roll_idx]
+                else:
+                    print(f"increase end date for {time_period.end} to extend to next roll, "
+                          f"meanwhile using last available roll={next_roll} @ {observed_time}")
+            roll_schedule[observed_time] = next_roll
+        roll_schedule = pd.Series(roll_schedule)
+    return roll_schedule
+
+
+def find_upto_date_from_datetime_index(index: Union[pd.DatetimeIndex, List[pd.Timestamp]],
+                                       date: pd.Timestamp
+                                       ) -> Optional[pd.Timestamp]:
+    """Finds the latest date in the index that is on or before the specified date.
+
+    Uses binary search to efficiently find the largest date in the index that is
+    less than or equal to the target date, even when the target date is not
+    present in the index. Input order does not affect the result, and ``NaT``
+    entries do not match a finite target.
+
+    Args:
+        index: DatetimeIndex or list of timestamps to search within. The timestamps
+            need not be chronologically ordered.
+        date: Target date to find the latest preceding date for.
+
+    Returns:
+        The latest timestamp in index that is <= date, or None if date is before
+        the earliest finite timestamp in the index or the index contains no finite timestamps.
+
+    Warns:
+        UserWarning: If the target date is before the earliest finite date in the index or the
+            index contains no finite timestamps.
+
+    Example:
+        >>> index = pd.date_range('2023-01-01', periods=5, freq='D')
+        >>> find_upto_date_from_datetime_index(index, pd.Timestamp('2023-01-03'))
+        Timestamp('2023-01-03 00:00:00', freq='D')
+        >>> find_upto_date_from_datetime_index(index, pd.Timestamp('2023-01-02 12:00'))
+        Timestamp('2023-01-02 00:00:00', freq='D')
+    """
+    # Search and return from one ordered view so the insertion position addresses the same data.
+    ordered_index = cast(
+        List[pd.Timestamp], pd.DatetimeIndex(index).dropna().sort_values().to_list()
+    )
+    if not ordered_index:
+        warnings.warn(
+            "find_upto_date_from_datetime_index: index contains no finite timestamps, "
+            "returning None",
+            stacklevel=2,
+        )
+        return None
+    matched_index = bisect_right(ordered_index, date)
+    # check left boundary
+    if matched_index == 0:
+        warnings.warn(
+            f"find_upto_date_from_datetime_index: date={date} is below first date of "
+            f"the index={ordered_index[0]}, returning None",
+            stacklevel=2,
+        )
+        return None
+    matched_date = ordered_index[matched_index - 1]
+    return matched_date
+
+
+def create_rebalancing_indicators_from_freqs(rebalancing_freqs: Union[pd.Series, str],
+                                             time_period: TimePeriod,
+                                             tickers: Union[List[str], pd.Index] = None,
+                                             include_start_date: bool = False,
+                                             include_end_date: bool = False
+                                             ) -> pd.DataFrame:
+    """
+    rebalancing_freq are series with data of type {'SPY': 'QE', 'TLT': 'ME'}
+    """
+    if isinstance(rebalancing_freqs, str):
+        if tickers is None:
+            raise TypeError(f"list of tickers must be provided")
+        dates_schedule = generate_dates_schedule(time_period=time_period,
+                                                     freq=rebalancing_freqs,
+                                                     include_start_date=include_start_date,
+                                                     include_end_date=include_end_date)
+        rebalancing_indicators = pd.DataFrame(1.0, index=dates_schedule, columns=tickers)
+
+    elif isinstance(rebalancing_freqs, pd.Series):
+        freqs_dict = rebalancing_freqs.groupby(rebalancing_freqs)
+        rebalancing_indicators = []
+        for freq, tickers in freqs_dict:
+            dates_schedule = generate_dates_schedule(time_period=time_period,
+                                                     freq=str(freq),
+                                                     include_start_date=include_start_date,
+                                                     include_end_date=include_end_date)
+            df = pd.DataFrame(1.0, index=dates_schedule, columns=tickers.index)
+            rebalancing_indicators.append(df)
+        rebalancing_indicators = pd.concat(rebalancing_indicators,
+                                           axis=1, sort=True).fillna(0.0)[rebalancing_freqs.index]
+
+    else:
+        raise NotImplementedError(f"type(rebalancing_freqs)={type(rebalancing_freqs)}")
+    return rebalancing_indicators
